@@ -109,7 +109,7 @@ describe("CodexSessionService", () => {
       createDefaultLaunchProfile("workspace-write", "never"),
       createLaunchProfile({
         id: "readonly",
-        label: "Read Only",
+        label: "只读",
         sandboxMode: "read-only",
         approvalPolicy: "never",
       }),
@@ -124,7 +124,7 @@ describe("CodexSessionService", () => {
   });
 
   const createCallbacks = () => ({
-    onTextDelta: vi.fn(),
+    onAgentMessage: vi.fn(),
     onToolStart: vi.fn(),
     onToolUpdate: vi.fn(),
     onToolEnd: vi.fn(),
@@ -170,7 +170,7 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/base",
       model: "o3",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",
@@ -203,7 +203,7 @@ describe("CodexSessionService", () => {
       model: "gpt-5.4",
       reasoningEffort: "high",
       launchProfileId: "readonly",
-      launchProfileLabel: "Read Only",
+      launchProfileLabel: "只读",
       launchProfileBehavior: "read-only / never",
       sandboxMode: "read-only",
       approvalPolicy: "never",
@@ -230,7 +230,7 @@ describe("CodexSessionService", () => {
     const firstThread = mockState.createdThreads[0];
 
     const profile = service.setLaunchProfile("readonly");
-    expect(profile.label).toBe("Read Only");
+    expect(profile.label).toBe("只读");
     expect(firstThread.options.sandboxMode).toBe("workspace-write");
 
     await service.newThread();
@@ -260,19 +260,19 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/base",
       model: "o3",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",
       unsafeLaunch: false,
       nextLaunchProfileId: "readonly",
-      nextLaunchProfileLabel: "Read Only",
+      nextLaunchProfileLabel: "只读",
       nextLaunchProfileBehavior: "read-only / never",
       nextUnsafeLaunch: false,
     });
   });
 
-  it("translates agent_message events into text deltas", async () => {
+  it("delivers each completed agent message once", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];
     const callbacks = createCallbacks();
@@ -289,9 +289,28 @@ describe("CodexSessionService", () => {
 
     await service.prompt("hello", callbacks);
 
-    expect(callbacks.onTextDelta.mock.calls.map(([delta]) => delta)).toEqual(["Hel", "lo", " world"]);
+    expect(callbacks.onAgentMessage).toHaveBeenCalledTimes(1);
+    expect(callbacks.onAgentMessage).toHaveBeenCalledWith("Hello world");
     expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
     expect(service.getInfo().threadId).toBe("thread-123");
+  });
+
+  it("delivers multiple completed agent messages in order", async () => {
+    const service = await CodexSessionService.create(createConfig());
+    const thread = mockState.createdThreads[0];
+    const callbacks = createCallbacks();
+
+    thread.runStreamed.mockResolvedValueOnce({
+      events: streamEvents([
+        { type: "item.completed", item: { id: "msg-1", type: "agent_message", text: "第一段" } },
+        { type: "item.completed", item: { id: "msg-2", type: "agent_message", text: "第二段" } },
+        { type: "turn.completed", usage },
+      ]),
+    });
+
+    await service.prompt("测试", callbacks);
+
+    expect(callbacks.onAgentMessage.mock.calls).toEqual([["第一段"], ["第二段"]]);
   });
 
   it("maps command_execution events to tool callbacks", async () => {
@@ -692,7 +711,7 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/other",
       model: "o3",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",
@@ -719,7 +738,7 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/base",
       model: "o3",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",
@@ -756,7 +775,7 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/from-db",
       model: "gpt-5.4-mini",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",
@@ -844,7 +863,7 @@ describe("CodexSessionService", () => {
 
     expect(thread.runStreamed).toHaveBeenCalledWith(
       [
-        { type: "text", text: "describe this" },
+        { type: "text", text: "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。\n\ndescribe this" },
         { type: "local_image", path: "/tmp/img.png" },
       ],
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
@@ -862,7 +881,7 @@ describe("CodexSessionService", () => {
     );
 
     expect(thread.runStreamed).toHaveBeenCalledWith(
-      "Files staged at /inbox:\n- log.txt\n\nanalyze this",
+      "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。\n\nFiles staged at /inbox:\n- log.txt\n\nanalyze this",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
@@ -875,7 +894,7 @@ describe("CodexSessionService", () => {
     await service.prompt({ stagedFileInstructions: "Files staged at /inbox:\n- log.txt" }, callbacks);
 
     expect(thread.runStreamed).toHaveBeenCalledWith(
-      "Files staged at /inbox:\n- log.txt",
+      "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。\n\nFiles staged at /inbox:\n- log.txt",
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
@@ -888,19 +907,25 @@ describe("CodexSessionService", () => {
     await service.prompt({ imagePaths: ["/tmp/img.png"] }, callbacks);
 
     expect(thread.runStreamed).toHaveBeenCalledWith(
-      [{ type: "local_image", path: "/tmp/img.png" }],
+      [
+        { type: "text", text: "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。" },
+        { type: "local_image", path: "/tmp/img.png" },
+      ],
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
   });
 
-  it("keeps string inputs unchanged when calling the SDK", async () => {
+  it("prepends the Chinese response instruction to string inputs", async () => {
     const service = await CodexSessionService.create(createConfig());
     const thread = mockState.createdThreads[0];
     const callbacks = createCallbacks();
 
     await service.prompt("hello", callbacks);
 
-    expect(thread.runStreamed).toHaveBeenCalledWith("hello", expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(thread.runStreamed).toHaveBeenCalledWith(
+      "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。\n\nhello",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it("handback clears the active thread and returns thread id plus workspace", async () => {
@@ -924,7 +949,7 @@ describe("CodexSessionService", () => {
       workspace: "/workspace/base",
       model: "o3",
       launchProfileId: "default",
-      launchProfileLabel: "Default",
+      launchProfileLabel: "默认",
       launchProfileBehavior: "workspace-write / never",
       sandboxMode: "workspace-write",
       approvalPolicy: "never",

@@ -76,7 +76,7 @@ describe("stageFile", () => {
         turnId: "turn-2",
         maxFileSize: 512,
       }),
-    ).rejects.toThrow("File too large");
+    ).rejects.toThrow("文件过大");
   });
 
   it("sanitizes the filename", async () => {
@@ -110,7 +110,7 @@ describe("buildFileInstructions", () => {
     expect(result).toContain("log.txt");
     expect(result).toContain("text/plain");
     expect(result).toContain("/workspace/.telecodex/turns/t1/out");
-    expect(result).toContain("staged on disk");
+    expect(result).toContain("已暂存到磁盘");
   });
 });
 

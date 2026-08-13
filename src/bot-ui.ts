@@ -11,39 +11,40 @@ export interface DualText {
 export function renderHelpMessage(): DualText {
   const sections = [
     {
-      title: "💬 Session",
+      title: "💬 会话",
       commands: [
-        ["/new", "Start a new thread"],
-        ["/session", "Current thread details"],
-        ["/sessions", "Browse & switch threads"],
-        ["/attach", "Bind a Codex thread to this topic"],
-        ["/handback", "Hand thread back to Codex CLI"],
-        ["/abort", "Cancel current operation"],
-        ["/retry", "Resend the last prompt"],
+        ["/new", "新建会话"],
+        ["/plan", "切换 Plan Mode"],
+        ["/session", "查看当前会话详情"],
+        ["/sessions", "浏览并切换会话"],
+        ["/attach", "将 Codex 会话绑定到当前话题"],
+        ["/handback", "将会话交还给 Codex CLI"],
+        ["/abort", "取消当前操作"],
+        ["/retry", "重新发送上一条提问"],
       ],
     },
     {
-      title: "🤖 Model",
+      title: "🤖 模型",
       commands: [
-        ["/launch_profiles", "Select launch profile"],
-        ["/model", "View & change model"],
-        ["/effort", "Set reasoning effort"],
+        ["/launch_profiles", "选择启动配置"],
+        ["/model", "查看并切换模型"],
+        ["/effort", "设置推理强度"],
       ],
     },
     {
-      title: "🔐 Auth",
+      title: "🔐 认证",
       commands: [
-        ["/auth", "Check auth status"],
-        ["/login", "Start authentication"],
-        ["/logout", "Sign out"],
+        ["/auth", "检查认证状态"],
+        ["/login", "开始认证"],
+        ["/logout", "退出登录"],
       ],
     },
     {
-      title: "ℹ️ Utility",
+      title: "ℹ️ 工具",
       commands: [
-        ["/start", "Welcome & status"],
-        ["/help", "This reference"],
-        ["/voice", "Voice transcription status"],
+        ["/start", "欢迎与状态"],
+        ["/help", "查看命令说明"],
+        ["/voice", "查看语音转写状态"],
       ],
     },
   ];
@@ -55,8 +56,8 @@ export function renderHelpMessage(): DualText {
     htmlLines.push(`<b>${escapeHTML(section.title)}</b>`);
     plainLines.push(section.title);
     for (const [cmd, desc] of section.commands) {
-      htmlLines.push(`  ${cmd} — ${escapeHTML(desc)}`);
-      plainLines.push(`  ${cmd} — ${desc}`);
+      htmlLines.push(`  ${cmd}：${escapeHTML(desc)}`);
+      plainLines.push(`  ${cmd}：${desc}`);
     }
     htmlLines.push("");
     plainLines.push("");
@@ -80,20 +81,20 @@ export function renderHelpMessage(): DualText {
  */
 export function renderWelcomeFirstTime(authWarning?: string): DualText {
   const htmlLines = [
-    "<b>👋 TeleCodex is ready.</b>",
+    "<b>👋 TeleCodex 已就绪。</b>",
     "",
-    "Send a message to start chatting with Codex.",
-    "You can also send voice notes, photos, or documents.",
+    "发送消息即可开始与 Codex 对话。",
+    "也可以发送语音、图片或文件。",
     "",
-    "Type /help for all commands.",
+    "输入 /help 查看全部命令。",
   ];
   const plainLines = [
-    "👋 TeleCodex is ready.",
+    "👋 TeleCodex 已就绪。",
     "",
-    "Send a message to start chatting with Codex.",
-    "You can also send voice notes, photos, or documents.",
+    "发送消息即可开始与 Codex 对话。",
+    "也可以发送语音、图片或文件。",
     "",
-    "Type /help for all commands.",
+    "输入 /help 查看全部命令。",
   ];
 
   if (authWarning) {
@@ -113,7 +114,7 @@ export function renderWelcomeReturning(
   isTopicSession: boolean,
   authWarning?: string,
 ): DualText {
-  const label = isTopicSession ? "TeleCodex (topic session)" : "TeleCodex";
+  const label = isTopicSession ? "TeleCodex（话题会话）" : "TeleCodex";
 
   const htmlLines = [`<b>👋 ${escapeHTML(label)}</b>`, "", sessionHtml];
   const plainLines = [`👋 ${label}`, "", sessionPlain];
@@ -140,8 +141,8 @@ export function formatSessionLabel(
   },
 ): string {
   const prefix = options.isActive ? "✅" : "📁";
-  const workspaceName = trimLabel(getWorkspaceShortName(options.workspace), 12) || "(unknown)";
-  const title = trimLabel(options.title || "(untitled)", 20) || "(untitled)";
+  const workspaceName = trimLabel(getWorkspaceShortName(options.workspace), 12) || "（未知）";
+  const title = trimLabel(options.title || "（未命名）", 20) || "（未命名）";
   const time = options.relativeTime;
 
   let label = `${prefix} ${workspaceName} · ${title} · ${time}`;

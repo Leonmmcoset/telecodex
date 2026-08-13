@@ -27,6 +27,12 @@ import {
   type CodexSessionInfo,
   type CodexSessionService,
 } from "./codex-session.js";
+import type {
+  AppServerApprovalRequest,
+  AppServerPlanUpdate,
+  AppServerUserInputRequest,
+  AppServerUserInputQuestion,
+} from "./codex-app-server.js";
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "./codex-auth.js";
 import {
   findLaunchProfile,
@@ -40,17 +46,17 @@ import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
 import { SessionRegistry } from "./session-registry.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { ensureWorkspaceDirectory } from "./workspace.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
-const EDIT_DEBOUNCE_MS = 1500;
 const TYPING_INTERVAL_MS = 4500;
 const TOOL_OUTPUT_PREVIEW_LIMIT = 500;
-const STREAMING_PREVIEW_LIMIT = 3800;
 const FORMATTED_CHUNK_TARGET = 3000;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
+const TELEGRAM_API_TIMEOUT_SECONDS = 40;
 
 type TelegramChatId = number | string;
 type TelegramParseMode = "HTML";
@@ -80,6 +86,38 @@ type RenderedChunk = RenderedText & {
   sourceText: string;
 };
 
+type PendingPlanAction = {
+  contextKey: TelegramContextKey;
+  messageId: number;
+  confirm?: () => Promise<void>;
+  steer: (text: string) => Promise<void>;
+  cancel: () => Promise<void>;
+  regenerate?: () => Promise<void>;
+};
+
+type PlanActionHandlers = Omit<PendingPlanAction, "contextKey" | "messageId">;
+
+type PendingPlanInput = {
+  contextKey: TelegramContextKey;
+  chatId: TelegramChatId;
+  messageThreadId?: number;
+  question: AppServerUserInputQuestion;
+  resolve: (value: string) => void;
+  reject: (error: Error) => void;
+};
+
+type PendingPlanDecision = {
+  contextKey: TelegramContextKey;
+  request: AppServerApprovalRequest;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+};
+
+type PlanMessage = {
+  actionId: string;
+  messageId: number;
+};
+
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -96,11 +134,11 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
 
   if (totalPages > 1) {
     if (currentPage > 0) {
-      keyboard.text("◀️ Prev", `${prefix}_page_${currentPage - 1}`);
+      keyboard.text("◀️ 上一页", `${prefix}_page_${currentPage - 1}`);
     }
     keyboard.text(`${currentPage + 1}/${totalPages}`, NOOP_PAGE_CALLBACK_DATA);
     if (currentPage < totalPages - 1) {
-      keyboard.text("Next ▶️", `${prefix}_page_${currentPage + 1}`);
+      keyboard.text("下一页 ▶️", `${prefix}_page_${currentPage + 1}`);
     }
   }
 
@@ -108,9 +146,10 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
 }
 
 export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
-  const bot = new Bot<Context>(config.telegramBotToken);
+  const bot = new Bot<Context>(config.telegramBotToken, {
+    client: { timeoutSeconds: TELEGRAM_API_TIMEOUT_SECONDS },
+  });
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
-
   const contextBusy = new Map<
     TelegramContextKey,
     { processing: boolean; switching: boolean; transcribing: boolean }
@@ -124,6 +163,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingPlanActions = new Map<string, PendingPlanAction>();
+  const pendingPlanInputs = new Map<string, PendingPlanInput>();
+  const pendingPlanDecisions = new Map<string, PendingPlanDecision>();
+  const pendingPlanSteers = new Map<TelegramContextKey, PendingPlanAction>();
+  const pendingPlanTextRequests = new Map<TelegramContextKey, string>();
+  const planModeContexts = new Set<TelegramContextKey>();
+  const planMessages = new Map<TelegramContextKey, PlanMessage>();
+  const planRenderQueues = new Map<TelegramContextKey, Promise<void>>();
+  const pendingWorkspacePathRequests = new Set<TelegramContextKey>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
 
   registry.onRemove((key) => {
@@ -131,6 +179,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
+    pendingWorkspacePathRequests.delete(key);
+    pendingPlanSteers.delete(key);
+    pendingPlanTextRequests.delete(key);
+    planModeContexts.delete(key);
+    planMessages.delete(key);
+    planRenderQueues.delete(key);
+    for (const [requestId, request] of pendingPlanInputs.entries()) {
+      if (request.contextKey === key) {
+        request.reject(new Error("会话已关闭。"));
+        pendingPlanInputs.delete(requestId);
+      }
+    }
+    for (const [actionId, decision] of pendingPlanDecisions.entries()) {
+      if (decision.contextKey === key) {
+        decision.reject(new Error("会话已关闭。"));
+        pendingPlanDecisions.delete(actionId);
+      }
+    }
+    for (const [actionId, action] of pendingPlanActions.entries()) {
+      if (action.contextKey === key) pendingPlanActions.delete(actionId);
+    }
     lastPromptInput.delete(key);
   });
 
@@ -176,6 +245,30 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingUnsafeLaunchConfirmations.delete(contextKey);
   };
 
+  const clearPlanInteractionState = (contextKey: TelegramContextKey, error?: Error): void => {
+    pendingPlanSteers.delete(contextKey);
+    pendingPlanTextRequests.delete(contextKey);
+    const planMessage = planMessages.get(contextKey);
+    if (planMessage) pendingPlanActions.delete(planMessage.actionId);
+    planMessages.delete(contextKey);
+
+    for (const [requestId, request] of pendingPlanInputs.entries()) {
+      if (request.contextKey === contextKey) {
+        pendingPlanInputs.delete(requestId);
+        if (error) request.reject(error);
+      }
+    }
+    for (const [actionId, decision] of pendingPlanDecisions.entries()) {
+      if (decision.contextKey === contextKey) {
+        pendingPlanDecisions.delete(actionId);
+        if (error) decision.reject(error);
+      }
+    }
+    for (const [actionId, action] of pendingPlanActions.entries()) {
+      if (action.contextKey === contextKey) pendingPlanActions.delete(actionId);
+    }
+  };
+
   const handlePageCallback = (
     pattern: RegExp,
     prefix: string,
@@ -213,8 +306,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   };
 
   const sendBusyReply = async (ctx: Context): Promise<void> => {
-    await safeReply(ctx, escapeHTML("Still working on previous message..."), {
-      fallbackText: "Still working on previous message...",
+    await safeReply(ctx, escapeHTML("上一条消息仍在处理中，请稍候……"), {
+      fallbackText: "上一条消息仍在处理中，请稍候……",
     });
   };
 
@@ -262,12 +355,197 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       updateSessionMetadata(contextKey, session);
       return true;
     } catch (error) {
-      await safeReply(ctx, escapeHTML(`Failed to create thread: ${friendlyErrorText(error)}`), {
-        fallbackText: `Failed to create thread: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, escapeHTML(`创建会话失败：${friendlyErrorText(error)}`), {
+        fallbackText: `创建会话失败：${friendlyErrorText(error)}`,
       });
       return false;
     }
   };
+
+  const renderPlanCard = async (
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    text: string,
+    actions: PlanActionHandlers,
+  ): Promise<void> => {
+    const previous = planRenderQueues.get(contextKey) ?? Promise.resolve();
+    const render = previous.then(async () => {
+      const previousMessage = planMessages.get(contextKey);
+      if (previousMessage) pendingPlanActions.delete(previousMessage.actionId);
+
+      const actionId = randomUUID().slice(0, 12);
+      const keyboard = new InlineKeyboard();
+      if (actions.confirm) {
+        keyboard.text("▶️ 执行此计划", `plan_confirm:${actionId}`).row();
+      }
+      if (actions.regenerate) {
+        keyboard.text("🔄 重新生成计划", `plan_regenerate:${actionId}`).row();
+      }
+      keyboard
+        .text("✏️ 继续修改", `plan_steer:${actionId}`)
+        .text("⏹ 取消", `plan_cancel:${actionId}`);
+
+      let messageId: number;
+      if (previousMessage) {
+        messageId = previousMessage.messageId;
+        await safeEditMessage(bot, chatId, messageId, text, {
+          fallbackText: text.replace(/<[^>]+>/g, ""),
+          replyMarkup: keyboard,
+        });
+      } else {
+        const message = await sendTextMessage(bot.api, chatId, text, {
+          parseMode: "HTML",
+          fallbackText: text.replace(/<[^>]+>/g, ""),
+          replyMarkup: keyboard,
+          messageThreadId,
+        });
+        messageId = message.message_id;
+      }
+
+      pendingPlanActions.set(actionId, { contextKey, messageId, ...actions });
+      planMessages.set(contextKey, { actionId, messageId });
+    });
+    planRenderQueues.set(contextKey, render.catch(() => {}));
+    await render;
+  };
+
+  const renderPlanUpdate = async (
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    update: AppServerPlanUpdate,
+    actions: PlanActionHandlers,
+  ): Promise<void> => {
+    const lines = update.plan.map((step) => {
+      const icon = step.status === "completed" ? "✅" : step.status === "inProgress" ? "🔄" : "⬜";
+      return `${icon} ${escapeHTML(step.step)}`;
+    });
+    const text = [
+      "🧭 <b>Plan Mode</b>",
+      update.explanation ? escapeHTML(update.explanation) : undefined,
+      lines.join("\n"),
+    ].filter((line): line is string => Boolean(line)).join("\n\n");
+    await renderPlanCard(contextKey, chatId, messageThreadId, text, actions);
+  };
+
+  const renderPlanDraft = async (
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    draft: string | undefined,
+    actions: PlanActionHandlers,
+  ): Promise<void> => {
+    const text = draft?.trim()
+      ? ["🧭 <b>Plan Mode</b>", "<b>计划草案：</b>", formatTelegramHTML(draft.trim())].join("\n\n")
+      : "🧭 <b>Plan Mode</b>\n\n⚠️ 未收到可确认的计划内容";
+    await renderPlanCard(contextKey, chatId, messageThreadId, text, actions);
+  };
+
+  const requestPlanUserInput = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: AppServerUserInputRequest,
+  ): Promise<{ answers: Record<string, { answers: string[] }> }> => {
+    const answers: Record<string, { answers: string[] }> = {};
+    for (const question of request.questions) {
+      const answer = await requestSinglePlanQuestion(ctx, contextKey, chatId, messageThreadId, request, question);
+      answers[question.id] = { answers: [answer] };
+    }
+    return { answers };
+  };
+
+  const requestSinglePlanQuestion = (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: AppServerUserInputRequest,
+    question: AppServerUserInputQuestion,
+  ): Promise<string> => {
+    const requestId = randomUUID().slice(0, 12);
+    return new Promise<string>((resolve, reject) => {
+      const pending: PendingPlanInput = {
+        contextKey,
+        chatId,
+        messageThreadId,
+        question,
+        resolve,
+        reject,
+      };
+      pendingPlanInputs.set(requestId, pending);
+
+      const keyboard = new InlineKeyboard();
+      for (const [index, option] of (question.options ?? []).entries()) {
+        keyboard.text(option.label, `plan_answer:${requestId}:${index}`).row();
+      }
+      if (question.isOther || !question.options?.length) {
+        keyboard.text("✍️ 自定义回答", `plan_other:${requestId}`);
+      }
+
+      void safeReply(ctx, [
+        `<b>${escapeHTML(question.header || "需要你的选择")}</b>`,
+        escapeHTML(question.question),
+        question.options?.length ? question.options.map((option) => `• ${option.label}：${option.description}`).join("\n") : undefined,
+      ].filter((line): line is string => Boolean(line)).join("\n\n"), {
+        fallbackText: [question.header || "需要你的选择", question.question].join("\n\n"),
+        replyMarkup: keyboard,
+        messageThreadId,
+      }).catch((error) => {
+        if (pendingPlanInputs.get(requestId) === pending) {
+          pendingPlanInputs.delete(requestId);
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+    });
+  };
+
+  const requestPlanApproval = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    request: AppServerApprovalRequest,
+  ): Promise<unknown> => {
+    const actionId = randomUUID().slice(0, 12);
+    const description = request.kind === "command"
+      ? [`<b>需要确认命令：</b>`, `<pre>${escapeHTML(request.command ?? "（未知命令）")}</pre>`, request.reason ? escapeHTML(request.reason) : undefined].filter(Boolean).join("\n")
+      : [`<b>需要确认操作：</b>`, escapeHTML(request.reason ?? "Codex 请求额外权限。")].join("\n");
+    const keyboard = new InlineKeyboard()
+      .text("✅ 允许一次", `plan_approve:${actionId}:accept`)
+      .text("✅ 允许本次会话", `plan_approve:${actionId}:acceptForSession`)
+      .row()
+      .text("❌ 拒绝", `plan_approve:${actionId}:decline`);
+    const decision = waitForPlanDecision(actionId, contextKey, request);
+    void safeReply(ctx, description, {
+      fallbackText: description.replace(/<[^>]+>/g, ""),
+      replyMarkup: keyboard,
+      messageThreadId,
+    }).catch((error) => {
+      const pending = pendingPlanDecisions.get(actionId);
+      if (pending) {
+        pendingPlanDecisions.delete(actionId);
+        pending.reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+    return decision;
+  };
+
+  const waitForPlanDecision = (
+    actionId: string,
+    contextKey: TelegramContextKey,
+    request: AppServerApprovalRequest,
+  ): Promise<unknown> =>
+    new Promise((resolve, reject) => {
+      pendingPlanDecisions.set(actionId, {
+        contextKey,
+        request,
+        resolve,
+        reject,
+      });
+    });
 
   const handleUserPrompt = async (
     ctx: Context,
@@ -287,19 +565,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const busyState = getBusyState(contextKey);
     busyState.processing = true;
 
-    const abortKeyboard = new InlineKeyboard().text("⏹ Abort", `codex_abort:${contextKey}`);
+    const abortKeyboard = new InlineKeyboard().text("⏹ 取消", `codex_abort:${contextKey}`);
     const toolVerbosity: ToolVerbosity = config.toolVerbosity;
     const toolStates = new Map<string, ToolState>();
     const toolCounts = new Map<string, number>();
-    let accumulatedText = "";
-    let responseMessageId: number | undefined;
-    let responseMessagePromise: Promise<void> | undefined;
-    let lastRenderedText = "";
-    let lastEditAt = 0;
-    let flushTimer: NodeJS.Timeout | undefined;
-    let isFlushing = false;
-    let flushPending = false;
     let finalized = false;
+    let sentAgentMessage = false;
+    let messageQueue: Promise<void> = Promise.resolve();
+    const agentMessageIds: number[] = [];
     let planMessageId: number | undefined;
     let lastRenderedPlan = "";
     let planMessageSending = false;
@@ -322,168 +595,58 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       clearInterval(typingInterval);
     };
 
-    const clearFlushTimer = (): void => {
-      if (flushTimer) {
-        clearTimeout(flushTimer);
-        flushTimer = undefined;
-      }
-    };
-
-    const renderPreview = (): RenderedChunk => {
-      const previewText = buildStreamingPreview(accumulatedText);
-      return renderMarkdownChunkWithinLimit(previewText);
-    };
-
-    const buildFinalResponseText = (text: string): string => {
-      const trimmedText = text.trim();
+    const buildCompletionText = (): string => {
       const usageLine =
         config.showTurnTokenUsage && lastTurnUsage ? formatTurnUsageLine(lastTurnUsage) : "";
 
       if (toolVerbosity === "summary") {
         const footerLines = [formatToolSummaryLine(toolCounts), usageLine].filter((line): line is string => Boolean(line));
-        if (footerLines.length === 0) {
-          return trimmedText;
-        }
-
-        const footer = footerLines.join("\n");
-        return trimmedText ? `${trimmedText}\n\n${footer}` : footer;
+        return footerLines.join("\n");
       }
 
       if (toolVerbosity === "all" && usageLine) {
-        return trimmedText ? `${trimmedText}\n\n${usageLine}` : usageLine;
+        return usageLine;
       }
 
-      return trimmedText;
+      return "";
     };
 
-    const ensureResponseMessage = async (): Promise<void> => {
-      if (responseMessageId) {
-        return;
-      }
-      if (responseMessagePromise) {
-        await responseMessagePromise;
-        return;
-      }
-
-      responseMessagePromise = (async () => {
-        stopTyping();
-        const preview = renderPreview();
-        const message = await sendTextMessage(bot.api, chatId, preview.text, {
-          parseMode: preview.parseMode,
-          fallbackText: preview.fallbackText,
-          replyMarkup: abortKeyboard,
-          messageThreadId,
-        });
-        responseMessageId = message.message_id;
-        lastRenderedText = preview.text;
-        lastEditAt = Date.now();
-      })();
-
-      try {
-        await responseMessagePromise;
-      } finally {
-        responseMessagePromise = undefined;
-      }
-    };
-
-    const flushResponse = async (force = false): Promise<void> => {
-      if (!accumulatedText) {
-        return;
-      }
-      if (!responseMessageId) {
-        await ensureResponseMessage();
-        return;
-      }
-      if (isFlushing) {
-        flushPending = true;
-        return;
-      }
-
-      const now = Date.now();
-      if (!force && now - lastEditAt < EDIT_DEBOUNCE_MS) {
-        return;
-      }
-
-      const nextText = renderPreview();
-      if (nextText.text === lastRenderedText) {
-        return;
-      }
-
-      isFlushing = true;
-      try {
-        await safeEditMessage(bot, chatId, responseMessageId, nextText.text, {
-          parseMode: nextText.parseMode,
-          fallbackText: nextText.fallbackText,
-          replyMarkup: abortKeyboard,
-        });
-        lastRenderedText = nextText.text;
-        lastEditAt = Date.now();
-      } finally {
-        isFlushing = false;
-        if (flushPending) {
-          flushPending = false;
-          scheduleFlush();
-        }
-      }
-    };
-
-    const scheduleFlush = (): void => {
-      if (flushTimer || finalized) {
-        return;
-      }
-
-      const delay = Math.max(0, EDIT_DEBOUNCE_MS - (Date.now() - lastEditAt));
-      flushTimer = setTimeout(() => {
-        flushTimer = undefined;
-        void flushResponse().catch((error) => {
-          console.error("Failed to update Telegram response message", error);
-        });
-      }, delay);
-    };
-
-    const removeAbortKeyboard = async (): Promise<void> => {
-      if (!responseMessageId) {
-        return;
-      }
-
-      try {
-        await bot.api.editMessageReplyMarkup(chatId, responseMessageId, {
-          reply_markup: new InlineKeyboard(),
-        });
-      } catch (error) {
-        if (!isMessageNotModifiedError(error)) {
-          console.error("Failed to clear Abort button", error);
-        }
-      }
-    };
-
-    const deliverRenderedChunks = async (chunks: RenderedChunk[]): Promise<void> => {
+    const sendRenderedChunks = async (chunks: RenderedChunk[], replyMarkup?: InlineKeyboard): Promise<void> => {
       if (chunks.length === 0) {
         return;
       }
 
-      const [firstChunk, ...remainingChunks] = chunks;
-      if (responseMessageId) {
-        await safeEditMessage(bot, chatId, responseMessageId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-        });
-        await removeAbortKeyboard();
-      } else {
-        const message = await sendTextMessage(bot.api, chatId, firstChunk.text, {
-          parseMode: firstChunk.parseMode,
-          fallbackText: firstChunk.fallbackText,
-          messageThreadId,
-        });
-        responseMessageId = message.message_id;
-      }
-
-      for (const chunk of remainingChunks) {
-        await sendTextMessage(bot.api, chatId, chunk.text, {
+      for (const chunk of chunks) {
+        const message = await sendTextMessage(bot.api, chatId, chunk.text, {
           parseMode: chunk.parseMode,
           fallbackText: chunk.fallbackText,
+          replyMarkup,
           messageThreadId,
         });
+        if (replyMarkup === abortKeyboard) {
+          agentMessageIds.push(message.message_id);
+        }
+      }
+    };
+
+    const enqueueRenderedChunks = (chunks: RenderedChunk[], replyMarkup?: InlineKeyboard): Promise<void> => {
+      const delivery = messageQueue.then(() => sendRenderedChunks(chunks, replyMarkup));
+      messageQueue = delivery.catch((error) => {
+        console.error("发送 Telegram 消息失败", error);
+      });
+      return delivery;
+    };
+
+    const clearAbortButtons = async (): Promise<void> => {
+      await messageQueue;
+      for (const messageId of agentMessageIds) {
+        try {
+          await bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup: new InlineKeyboard() });
+        } catch (error) {
+          if (!isMessageNotModifiedError(error)) {
+            console.error("清理取消按钮失败", error);
+          }
+        }
       }
     };
 
@@ -494,47 +657,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       finalized = true;
 
       stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // If the initial send failed, we will fall back to sending the final response below.
-        }
+      const completionText = buildCompletionText();
+      if (completionText) {
+        await enqueueRenderedChunks(splitMarkdownForTelegram(completionText));
+      } else if (!sentAgentMessage) {
+        await enqueueRenderedChunks([
+          { text: "<b>✅ 已完成</b>", fallbackText: "✅ 已完成", parseMode: "HTML", sourceText: "✅ 已完成" },
+        ]);
       }
 
-      const finalText = buildFinalResponseText(accumulatedText);
-      if (!finalText) {
-        const html = "<b>✅ Done</b>";
-        const plainText = "✅ Done";
-
-        if (responseMessageId) {
-          await safeEditMessage(bot, chatId, responseMessageId, html, { fallbackText: plainText });
-          await removeAbortKeyboard();
-        } else {
-          await safeReply(ctx, html, { fallbackText: plainText });
-        }
-        return;
-      }
-
-      await deliverRenderedChunks(splitMarkdownForTelegram(finalText));
+      await messageQueue;
+      await clearAbortButtons();
     };
 
     const callbacks: CodexSessionCallbacks = {
-      onTextDelta: (delta: string) => {
-        accumulatedText += delta;
-        if (!responseMessageId) {
-          void ensureResponseMessage()
-            .then(() => {
-              scheduleFlush();
-            })
-            .catch((error) => {
-              console.error("Failed to send initial Telegram response message", error);
-            });
-          return;
-        }
-
-        scheduleFlush();
+      onAgentMessage: (text: string) => {
+        sentAgentMessage = true;
+        stopTyping();
+        void enqueueRenderedChunks(splitMarkdownForTelegram(text), abortKeyboard).catch((error) => {
+          console.error("发送 Codex 消息失败", error);
+        });
       },
       onToolStart: (toolName: string, toolCallId: string) => {
         if (toolVerbosity === "summary") {
@@ -657,11 +799,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
       },
-      onAgentEnd: () => {
-        void finalizeResponse().catch((error) => {
-          console.error("Failed to finalize Telegram response message", error);
-        });
-      },
+      onAgentEnd: () => {},
     };
 
     try {
@@ -670,19 +808,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(
           ctx,
           [
-            "<b>⚠️ Codex is not authenticated.</b>",
+            "<b>⚠️ Codex 尚未认证。</b>",
             "",
             `<code>${escapeHTML(authStatus.detail)}</code>`,
             "",
-            "Use /login to start authentication, or set CODEX_API_KEY on the host.",
+            "请使用 /login 开始认证，或在主机上设置 CODEX_API_KEY。",
           ].join("\n"),
           {
             fallbackText: [
-              "⚠️ Codex is not authenticated.",
+              "⚠️ Codex 尚未认证。",
               "",
               authStatus.detail,
               "",
-              "Use /login to start authentication, or set CODEX_API_KEY on the host.",
+              "请使用 /login 开始认证，或在主机上设置 CODEX_API_KEY。",
             ].join("\n"),
           },
         );
@@ -698,31 +836,197 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await finalizeResponse();
     } catch (error) {
       stopTyping();
-      clearFlushTimer();
-      if (responseMessagePromise) {
-        try {
-          await responseMessagePromise;
-        } catch {
-          // Ignore; we will send an error message below.
-        }
-      }
-
       if (finalized) {
-        console.error("Codex prompt error after finalization:", formatError(error));
+        console.error("Codex 完成后发生提问错误：", formatError(error));
       } else {
         finalized = true;
 
-        const combinedText = buildFinalResponseText(renderPromptFailure(accumulatedText, error));
-        const chunks = splitMarkdownForTelegram(combinedText);
+        const chunks = splitMarkdownForTelegram(renderPromptFailure(error));
         try {
-          await deliverRenderedChunks(chunks);
+          await enqueueRenderedChunks(chunks);
+          await clearAbortButtons();
         } catch (telegramError) {
-          console.error("Failed to send error message to Telegram:", telegramError);
+          console.error("向 Telegram 发送错误消息失败:", telegramError);
         }
       }
     } finally {
       stopTyping();
-      clearFlushTimer();
+      await clearAbortButtons();
+      busyState.processing = false;
+    }
+  };
+
+  const handlePlanPrompt = async (
+    ctx: Context,
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    session: CodexSessionService,
+    userInput: CodexPromptInput,
+    mode: "start" | "continue",
+  ): Promise<void> => {
+    const parsed = parseContextKey(contextKey);
+    const messageThreadId = parsed.messageThreadId;
+
+    if (isBusy(contextKey)) {
+      await sendBusyReply(ctx);
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.processing = true;
+    const toolStates = new Map<string, ToolState>();
+    const toolCounts = new Map<string, number>();
+    const toolVerbosity = config.toolVerbosity;
+    let lastPlanAgentMessage: string | undefined;
+    let receivedPlanContent = false;
+    let executingConfirmedPlan = false;
+    let latestPlanInput = userInput;
+    let lastTurnUsage: { inputTokens: number; cachedInputTokens: number; outputTokens: number } | undefined;
+    let finalized = false;
+
+    const typingInterval = setInterval(() => {
+      void bot.api.sendChatAction(chatId, "typing", {
+        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      }).catch(() => {});
+    }, TYPING_INTERVAL_MS);
+    void bot.api.sendChatAction(chatId, "typing", {
+      ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+    }).catch(() => {});
+
+    const stopTyping = (): void => clearInterval(typingInterval);
+    const buildPlanActions = (canConfirm = true): PlanActionHandlers => ({
+      ...(canConfirm ? {
+        confirm: async () => {
+          executingConfirmedPlan = true;
+          await session.executePlan("确认上述计划并开始执行。", callbacks);
+        },
+      } : {}),
+      steer: async (text) => {
+        const steerBusyState = getBusyState(contextKey);
+        steerBusyState.processing = true;
+        latestPlanInput = text;
+        lastPlanAgentMessage = undefined;
+        receivedPlanContent = false;
+        try {
+          await session.continuePlan(text, callbacks);
+          await finalizePlanView();
+        } finally {
+          steerBusyState.processing = false;
+        }
+      },
+      cancel: async () => {
+        await session.abort();
+      },
+      regenerate: async () => {
+        const regenerateBusyState = getBusyState(contextKey);
+        regenerateBusyState.processing = true;
+        lastPlanAgentMessage = undefined;
+        receivedPlanContent = false;
+        try {
+          await session.continuePlan(latestPlanInput, callbacks);
+          await finalizePlanView();
+        } finally {
+          regenerateBusyState.processing = false;
+        }
+      },
+    });
+
+    const updatePlan = (update: AppServerPlanUpdate): void => {
+      if (executingConfirmedPlan) return;
+      const hasPlanContent = Boolean(update.explanation?.trim()) || update.plan.some((step) => step.step.trim());
+      if (!hasPlanContent) return;
+      receivedPlanContent = true;
+      void renderPlanUpdate(contextKey, chatId, messageThreadId, update, buildPlanActions())
+        .catch((error) => console.error("发送 Plan Mode 计划失败", error));
+    };
+
+    const callbacks: CodexSessionCallbacks = {
+      onAgentMessage: (text) => {
+        stopTyping();
+        if (executingConfirmedPlan) {
+          void sendTextMessage(bot.api, chatId, formatTelegramHTML(text), {
+            parseMode: "HTML",
+            fallbackText: text,
+            messageThreadId,
+          }).catch((error) => console.error("发送执行计划消息失败", error));
+          return;
+        }
+        lastPlanAgentMessage = text;
+      },
+      onToolStart: (toolName, toolCallId) => {
+        if (toolVerbosity === "summary") {
+          toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
+          return;
+        }
+        if (toolVerbosity === "none") return;
+        toolStates.set(toolCallId, { toolName, partialResult: "" });
+      },
+      onToolUpdate: (toolCallId, partialResult) => {
+        const state = toolStates.get(toolCallId);
+        if (state) state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
+      },
+      onToolEnd: (toolCallId, isError) => {
+        const state = toolStates.get(toolCallId);
+        if (!state || toolVerbosity === "none" || toolVerbosity === "summary") return;
+        const rendered = renderToolEndMessage(state.toolName, state.partialResult, isError);
+        void sendTextMessage(bot.api, chatId, rendered.text, {
+          parseMode: rendered.parseMode,
+          fallbackText: rendered.fallbackText,
+          messageThreadId,
+        }).catch((error) => console.error("发送 Plan Mode 工具结果失败", error));
+      },
+      onPlanUpdate: updatePlan,
+      onUserInputRequest: (request) => requestPlanUserInput(ctx, contextKey, chatId, messageThreadId, request),
+      onApprovalRequest: (request) => requestPlanApproval(ctx, contextKey, chatId, messageThreadId, request),
+      onTurnComplete: (usage) => {
+        lastTurnUsage = usage;
+      },
+      onAgentEnd: () => {},
+    };
+
+    const finalizePlanView = async (): Promise<void> => {
+      await (planRenderQueues.get(contextKey) ?? Promise.resolve());
+      if (!receivedPlanContent) {
+        await renderPlanDraft(
+          contextKey,
+          chatId,
+          messageThreadId,
+          lastPlanAgentMessage,
+          buildPlanActions(Boolean(lastPlanAgentMessage?.trim())),
+        );
+      }
+      await (planRenderQueues.get(contextKey) ?? Promise.resolve());
+      updateSessionMetadata(contextKey, session);
+    };
+
+    try {
+      const authStatus = await checkAuthStatus(config.codexApiKey);
+      if (!authStatus.authenticated) {
+        await safeReply(ctx, "<b>⚠️ Codex 尚未认证。</b>\n\n请使用 /login 开始认证，或在主机上设置 CODEX_API_KEY。", {
+          fallbackText: "⚠️ Codex 尚未认证。\n\n请使用 /login 开始认证，或在主机上设置 CODEX_API_KEY。",
+        });
+        return;
+      }
+
+      if (!(await ensureActiveThread(ctx, contextKey, session))) {
+        return;
+      }
+
+      if (mode === "start") {
+        await session.promptPlan(userInput, callbacks);
+      } else {
+        await session.continuePlan(userInput, callbacks);
+      }
+      await finalizePlanView();
+      finalized = true;
+    } catch (error) {
+      if (!finalized) {
+        await safeReply(ctx, renderPromptFailure(error), {
+          fallbackText: renderPromptFailure(error).replace(/<[^>]+>/g, ""),
+        }).catch((telegramError) => console.error("向 Telegram 发送 Plan Mode 错误失败", telegramError));
+      }
+    } finally {
+      stopTyping();
       busyState.processing = false;
     }
   };
@@ -753,7 +1057,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       } catch (error) {
         failedCount += 1;
-        console.error(`Failed to send artifact ${artifact.name}:`, error);
+          console.error(`发送文件 ${artifact.name} 失败：`, error);
       }
     }
 
@@ -767,9 +1071,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const fromId = ctx.from?.id;
     if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
       if (ctx.callbackQuery) {
-        await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
+        await ctx.answerCallbackQuery({ text: "未授权" }).catch(() => {});
       } else if (ctx.chat) {
-        await safeReply(ctx, escapeHTML("Unauthorized"), { fallbackText: "Unauthorized" });
+        await safeReply(ctx, escapeHTML("未授权"), { fallbackText: "未授权" });
       }
       return;
     }
@@ -785,7 +1089,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const authStatus = await checkAuthStatus(config.codexApiKey);
-    const authWarning = authStatus.authenticated ? undefined : "Not authenticated. Use /login or set CODEX_API_KEY.";
+    const authWarning = authStatus.authenticated ? undefined : "尚未认证。请使用 /login，或设置 CODEX_API_KEY。";
     const isReturning = registry.hasMetadata(contextKey);
 
     if (isReturning) {
@@ -819,14 +1123,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const authStatus = await checkAuthStatus(config.codexApiKey);
     const icon = authStatus.authenticated ? "✅" : "❌";
     const html = [
-      `<b>${icon} Auth status:</b> ${authStatus.authenticated ? "authenticated" : "not authenticated"}`,
-      `<b>Method:</b> <code>${escapeHTML(authStatus.method)}</code>`,
-      `<b>Detail:</b> <code>${escapeHTML(authStatus.detail)}</code>`,
+      `<b>${icon} 认证状态：</b>${authStatus.authenticated ? "已认证" : "未认证"}`,
+      `<b>方式：</b><code>${escapeHTML(authStatus.method)}</code>`,
+      `<b>详情：</b><code>${escapeHTML(authStatus.detail)}</code>`,
     ].join("\n");
     const plain = [
-      `${icon} Auth status: ${authStatus.authenticated ? "authenticated" : "not authenticated"}`,
-      `Method: ${authStatus.method}`,
-      `Detail: ${authStatus.detail}`,
+      `${icon} 认证状态：${authStatus.authenticated ? "已认证" : "未认证"}`,
+      `方式：${authStatus.method}`,
+      `详情：${authStatus.detail}`,
     ].join("\n");
 
     await safeReply(ctx, html, { fallbackText: plain });
@@ -838,9 +1142,28 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const authStatus = await checkAuthStatus(config.codexApiKey);
+    if (authStatus.method === "config") {
+      await safeReply(
+        ctx,
+        [
+            "<b>本机已配置自定义 Codex 服务商。</b>",
+          "",
+            "请在主机的 <code>~/.codex/config.toml</code> 中管理其凭据。",
+        ].join("\n"),
+        {
+          fallbackText: [
+            "本机已配置自定义 Codex 服务商。",
+            "",
+            "请在主机的 ~/.codex/config.toml 中管理其凭据。",
+          ].join("\n"),
+        },
+      );
+      return;
+    }
+
     if (authStatus.authenticated) {
-      await safeReply(ctx, `<b>✅ Already authenticated</b> via <code>${escapeHTML(authStatus.method)}</code>.`, {
-        fallbackText: `✅ Already authenticated via ${authStatus.method}.`,
+      await safeReply(ctx, `<b>✅ 已通过 <code>${escapeHTML(authStatus.method)}</code> 完成认证。</b>`, {
+        fallbackText: `✅ 已通过 ${authStatus.method} 完成认证。`,
       });
       return;
     }
@@ -849,15 +1172,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await safeReply(
         ctx,
         [
-          "<b>Telegram-initiated login is disabled.</b>",
+          "<b>已禁用从 Telegram 发起登录。</b>",
           "",
-          "Run <code>codex login</code> on the host, or set CODEX_API_KEY in .env.",
+          "请在主机运行 <code>codex login</code>，或在 .env 中设置 CODEX_API_KEY。",
         ].join("\n"),
         {
           fallbackText: [
-            "Telegram-initiated login is disabled.",
+            "已禁用从 Telegram 发起登录。",
             "",
-            "Run 'codex login' on the host, or set CODEX_API_KEY in .env.",
+            "请在主机运行 'codex login'，或在 .env 中设置 CODEX_API_KEY。",
           ].join("\n"),
         },
       );
@@ -866,14 +1189,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const result = await startLogin();
     if (result.success) {
-      await safeReply(ctx, `<b>🔑 Login initiated.</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
-        fallbackText: `🔑 Login initiated.\n\n${result.message}`,
+      await safeReply(ctx, `<b>🔑 已开始登录。</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
+        fallbackText: `🔑 已开始登录。\n\n${result.message}`,
       });
       return;
     }
 
-    await safeReply(ctx, `<b>❌ Login failed.</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
-      fallbackText: `❌ Login failed.\n\n${result.message}`,
+    await safeReply(ctx, `<b>❌ 登录失败。</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
+      fallbackText: `❌ 登录失败。\n\n${result.message}`,
     });
   });
 
@@ -883,19 +1206,23 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const authStatus = await checkAuthStatus(config.codexApiKey);
-    if (authStatus.method === "api-key") {
+    if (authStatus.method === "api-key" || authStatus.method === "config") {
       await safeReply(
         ctx,
         [
-          "<b>Cannot logout via Telegram when using CODEX_API_KEY.</b>",
+          `<b>使用 ${authStatus.method === "api-key" ? "CODEX_API_KEY" : "自定义 Codex 服务商"} 时，无法通过 Telegram 退出登录。</b>`,
           "",
-          "Remove CODEX_API_KEY from .env to use CLI-based auth instead.",
+          authStatus.method === "api-key"
+            ? "请从 .env 中移除 CODEX_API_KEY，以改用 CLI 认证。"
+            : "请在主机的 ~/.codex/config.toml 中管理其凭据。",
         ].join("\n"),
         {
           fallbackText: [
-            "Cannot logout via Telegram when using CODEX_API_KEY.",
+            `使用 ${authStatus.method === "api-key" ? "CODEX_API_KEY" : "自定义 Codex 服务商"} 时，无法通过 Telegram 退出登录。`,
             "",
-            "Remove CODEX_API_KEY from .env to use CLI-based auth instead.",
+            authStatus.method === "api-key"
+              ? "请从 .env 中移除 CODEX_API_KEY，以改用 CLI 认证。"
+              : "请在主机的 ~/.codex/config.toml 中管理其凭据。",
           ].join("\n"),
         },
       );
@@ -904,36 +1231,36 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     if (!config.enableTelegramLogin) {
       await safeReply(ctx, [
-        "<b>Telegram-initiated auth management is disabled.</b>",
+        "<b>已禁用从 Telegram 管理认证。</b>",
         "",
-        "Run <code>codex logout</code> on the host.",
+        "请在主机运行 <code>codex logout</code>。",
       ].join("\n"), {
         fallbackText: [
-          "Telegram-initiated auth management is disabled.",
+          "已禁用从 Telegram 管理认证。",
           "",
-          "Run 'codex logout' on the host.",
+          "请在主机运行 'codex logout'。",
         ].join("\n"),
       });
       return;
     }
 
     if (!authStatus.authenticated) {
-      await safeReply(ctx, escapeHTML("Not currently authenticated."), {
-        fallbackText: "Not currently authenticated.",
+      await safeReply(ctx, escapeHTML("当前未认证。"), {
+        fallbackText: "当前未认证。",
       });
       return;
     }
 
     const result = await startLogout();
     if (result.success) {
-      await safeReply(ctx, `<b>🔓 Logged out.</b>\n\n${escapeHTML(result.message)}`, {
-        fallbackText: `🔓 Logged out.\n\n${result.message}`,
+      await safeReply(ctx, `<b>🔓 已退出登录。</b>\n\n${escapeHTML(result.message)}`, {
+        fallbackText: `🔓 已退出登录。\n\n${result.message}`,
       });
       return;
     }
 
-    await safeReply(ctx, `<b>❌ Logout failed.</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
-      fallbackText: `❌ Logout failed.\n\n${result.message}`,
+    await safeReply(ctx, `<b>❌ 退出登录失败。</b>\n\n<code>${escapeHTML(result.message)}</code>`, {
+      fallbackText: `❌ 退出登录失败。\n\n${result.message}`,
     });
   });
 
@@ -948,17 +1275,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await safeReply(
         ctx,
         [
-          "<b>Voice transcription is not available.</b>",
+          "<b>语音转写不可用。</b>",
           "",
-          "Install <code>parakeet-coreml</code> + ffmpeg, or set <code>OPENAI_API_KEY</code>.",
-          "<i>Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.</i>",
+          "请安装 <code>parakeet-coreml</code> 和 ffmpeg，或设置 <code>OPENAI_API_KEY</code>。",
+          "<i>注意：语音转写使用 OPENAI_API_KEY，而不是 CODEX_API_KEY。</i>",
         ].join("\n"),
         {
           fallbackText: [
-            "Voice transcription is not available.",
+            "语音转写不可用。",
             "",
-            "Install parakeet-coreml + ffmpeg, or set OPENAI_API_KEY.",
-            "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.",
+            "请安装 parakeet-coreml 和 ffmpeg，或设置 OPENAI_API_KEY。",
+            "注意：语音转写使用 OPENAI_API_KEY，而不是 CODEX_API_KEY。",
           ].join("\n"),
         },
       );
@@ -966,8 +1293,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const joined = backends.join(" + ");
-    await safeReply(ctx, `<b>Voice backends:</b> <code>${escapeHTML(joined)}</code>`, {
-      fallbackText: `Voice backends: ${joined}`,
+    await safeReply(ctx, `<b>语音后端：</b><code>${escapeHTML(joined)}</code>`, {
+      fallbackText: `语音后端：${joined}`,
     });
   });
 
@@ -984,40 +1311,25 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot create a new thread while a prompt is running."), {
-        fallbackText: "Cannot create a new thread while a prompt is running.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法新建会话。"), {
+        fallbackText: "当前提问仍在处理中，无法新建会话。",
       });
       return;
     }
 
     const workspaces = session.listWorkspaces();
-    if (workspaces.length <= 1) {
-      try {
-        const info = await session.newThread();
-        updateSessionMetadata(contextKey, session);
-        const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
-        const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
-        const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
-        await safeReply(ctx, html, { fallbackText: plainText });
-      } catch (error) {
-        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-          fallbackText: `Failed: ${friendlyErrorText(error)}`,
-        });
-      }
-      return;
-    }
-
     pendingWorkspacePicks.set(contextKey, workspaces);
     const currentWorkspace = session.getCurrentWorkspace();
-    const workspaceButtons = workspaces.map((workspace, index) => ({
+    const workspaceButtons: KeyboardItem[] = workspaces.map((workspace, index) => ({
       label: `${workspace === currentWorkspace ? "📂" : "📁"} ${getWorkspaceShortName(workspace)}`,
       callbackData: `ws_${index}`,
     }));
+    workspaceButtons.push({ label: "📁 输入新路径", callbackData: "ws_new_path" });
     pendingWorkspaceButtons.set(contextKey, workspaceButtons);
     const keyboard = paginateKeyboard(workspaceButtons, 0, "ws");
 
-    await safeReply(ctx, "<b>Select workspace for new thread:</b>", {
-      fallbackText: "Select workspace for new thread:",
+    await safeReply(ctx, "<b>请选择新会话的工作目录，或输入一个新路径：</b>", {
+      fallbackText: "请选择新会话的工作目录，或输入一个新路径：",
       replyMarkup: keyboard,
     });
   });
@@ -1028,15 +1340,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    const { session } = contextSession;
+    const { contextKey, session } = contextSession;
     try {
       await session.abort();
-      await safeReply(ctx, escapeHTML("Aborted current operation"), {
-        fallbackText: "Aborted current operation",
+      clearPlanInteractionState(contextKey, new Error("操作已取消。"));
+      await safeReply(ctx, escapeHTML("已取消当前操作。"), {
+        fallbackText: "已取消当前操作。",
       });
     } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `失败：${friendlyErrorText(error)}`,
       });
     }
   });
@@ -1060,8 +1373,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const cached = lastPromptInput.get(contextKey);
     if (!cached) {
-      await safeReply(ctx, escapeHTML("Nothing to retry. Send a message first."), {
-        fallbackText: "Nothing to retry. Send a message first.",
+      await safeReply(ctx, escapeHTML("没有可重试的内容，请先发送一条消息。"), {
+        fallbackText: "没有可重试的内容，请先发送一条消息。",
       });
       return;
     }
@@ -1083,7 +1396,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     const info = session.getInfo();
-    const contextLabel = isTopicContext(contextKey) ? "Topic session" : "Chat session";
+    const contextLabel = isTopicContext(contextKey) ? "话题会话" : "聊天会话";
 
     const plainLines = [`${contextLabel}:`, renderSessionInfoPlain(info)];
     const htmlLines = [`<b>${escapeHTML(contextLabel)}:</b>`, renderSessionInfoHTML(info)];
@@ -1104,8 +1417,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot change launch profile while a prompt is running."), {
-        fallbackText: "Cannot change launch profile while a prompt is running.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法切换启动配置。"), {
+        fallbackText: "当前提问仍在处理中，无法切换启动配置。",
       });
       return;
     }
@@ -1126,26 +1439,26 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const keyboard = paginateKeyboard(launchButtons, 0, "launch");
     const htmlLines = [
-      `<b>Selected launch profile:</b> <code>${escapeHTML(selectedLaunchProfile.label)}</code>`,
-      `<b>Behavior:</b> <code>${escapeHTML(formatLaunchProfileBehavior(selectedLaunchProfile))}</code>`,
+      `<b>当前启动配置：</b><code>${escapeHTML(selectedLaunchProfile.label)}</code>`,
+      `<b>行为：</b><code>${escapeHTML(formatLaunchProfileBehavior(selectedLaunchProfile))}</code>`,
       "",
-      "Select a profile for new or reattached threads:",
+      "请选择用于新建或重新绑定会话的配置：",
     ];
     const plainLines = [
-      `Selected launch profile: ${selectedLaunchProfile.label}`,
-      `Behavior: ${formatLaunchProfileBehavior(selectedLaunchProfile)}`,
+      `当前启动配置：${selectedLaunchProfile.label}`,
+      `行为：${formatLaunchProfileBehavior(selectedLaunchProfile)}`,
       "",
-      "Select a profile for new or reattached threads:",
+      "请选择用于新建或重新绑定会话的配置：",
     ];
 
     if (selectedLaunchProfile.unsafe) {
-      htmlLines.splice(2, 0, "⚠️ <i>Selected profile uses danger-full-access.</i>");
-      plainLines.splice(2, 0, "⚠️ Selected profile uses danger-full-access.");
+      htmlLines.splice(2, 0, "⚠️ <i>当前配置使用 danger-full-access。</i>");
+      plainLines.splice(2, 0, "⚠️ 当前配置使用 danger-full-access。" );
     }
 
     if (info.nextLaunchProfileId) {
-      htmlLines.splice(2, 0, `<b>Active thread still uses:</b> <code>${escapeHTML(info.launchProfileLabel)}</code>`);
-      plainLines.splice(2, 0, `Active thread still uses: ${info.launchProfileLabel}`);
+      htmlLines.splice(2, 0, `<b>当前活动会话仍使用：</b><code>${escapeHTML(info.launchProfileLabel)}</code>`);
+      plainLines.splice(2, 0, `当前活动会话仍使用：${info.launchProfileLabel}`);
     }
 
     await safeReply(ctx, htmlLines.join("\n"), {
@@ -1157,6 +1470,61 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.command(["launch", "launch_profiles"], openLaunchProfilesPicker);
   bot.hears(/^\/launch-profiles(?:@\w+)?$/i, openLaunchProfilesPicker);
 
+  bot.command("plan", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) return;
+
+    const { contextKey, session } = contextSession;
+    const commandText = ctx.message?.text ?? "";
+    const argument = commandText.replace(/^\/plan(?:@\w+)?/i, "").trim();
+    const normalized = argument.toLowerCase();
+
+    if (!argument) {
+      const enabled = planModeContexts.has(contextKey);
+      if (enabled) planModeContexts.delete(contextKey);
+      else planModeContexts.add(contextKey);
+      const nowEnabled = !enabled;
+      await safeReply(ctx, nowEnabled
+        ? "🧭 <b>Plan Mode 已开启。</b>发送下一条消息即可进入计划模式。\n使用 /plan off 关闭。"
+        : "🧭 <b>Plan Mode 已关闭。</b>", {
+        fallbackText: nowEnabled
+          ? "🧭 Plan Mode 已开启。发送下一条消息即可进入计划模式。\n使用 /plan off 关闭。"
+          : "🧭 Plan Mode 已关闭。",
+      });
+      return;
+    }
+
+    if (normalized === "status" || normalized === "状态") {
+      const enabled = planModeContexts.has(contextKey);
+      await safeReply(ctx, enabled
+        ? "🧭 <b>Plan Mode 已开启。</b>发送下一条消息即可进入计划模式。\n使用 /plan off 关闭。"
+        : "🧭 <b>Plan Mode 当前未开启。</b>使用 /plan 开启，或使用 /plan on 开启。", {
+        fallbackText: enabled
+          ? "🧭 Plan Mode 已开启。发送下一条消息即可进入计划模式。\n使用 /plan off 关闭。"
+          : "🧭 Plan Mode 当前未开启。使用 /plan 开启，或使用 /plan on 开启。",
+      });
+      return;
+    }
+
+    if (normalized === "on" || normalized === "开启") {
+      planModeContexts.add(contextKey);
+      await safeReply(ctx, "🧭 <b>Plan Mode 已开启。</b>", { fallbackText: "🧭 Plan Mode 已开启。" });
+      return;
+    }
+
+    if (normalized === "off" || normalized === "关闭") {
+      planModeContexts.delete(contextKey);
+      await session.abort();
+      clearPlanInteractionState(contextKey, new Error("Plan Mode 已关闭。"));
+      await safeReply(ctx, "🧭 <b>Plan Mode 已关闭。</b>", { fallbackText: "🧭 Plan Mode 已关闭。" });
+      return;
+    }
+
+    planModeContexts.add(contextKey);
+    lastPromptInput.set(contextKey, argument);
+    await handlePlanPrompt(ctx, contextKey, ctx.chat?.id ?? 0, session, argument, "start");
+  });
+
   bot.command("handback", async (ctx) => {
     const contextSession = await getContextSession(ctx, { deferThreadStart: true });
     if (!contextSession) {
@@ -1165,15 +1533,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot hand back while a prompt is running. Use /abort first."), {
-        fallbackText: "Cannot hand back while a prompt is running. Use /abort first.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法交还会话。请先使用 /abort。"), {
+        fallbackText: "当前提问仍在处理中，无法交还会话。请先使用 /abort。",
       });
       return;
     }
 
     if (!session.hasActiveThread()) {
-      await safeReply(ctx, escapeHTML("No active thread to hand back."), {
-        fallbackText: "No active thread to hand back.",
+      await safeReply(ctx, escapeHTML("没有可交还的活动会话。"), {
+        fallbackText: "没有可交还的活动会话。",
       });
       return;
     }
@@ -1186,11 +1554,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(
           ctx,
           escapeHTML(
-            "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
+            "该会话尚未开始，因此没有可恢复的会话 ID。请发送一条消息创建会话，或使用 /new 新建会话。",
           ),
           {
             fallbackText:
-              "This thread has not started yet, so there is no resumable thread ID. Send a message to create one, or use /new to start fresh.",
+              "该会话尚未开始，因此没有可恢复的会话 ID。请发送一条消息创建会话，或使用 /new 新建会话。",
           },
         );
         return;
@@ -1215,35 +1583,35 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
 
       const plainText = [
-        "🔄 Thread handed back to Codex CLI.",
+        "🔄 会话已交还给 Codex CLI。",
         "",
-        "Run this in your terminal:",
+        "请在终端运行：",
         resumeCommand,
         copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 Command copied to clipboard!" : undefined,
+        copiedToClipboard ? "📋 命令已复制到剪贴板！" : undefined,
         "",
-        "Send any message here to start a new TeleCodex thread.",
+        "在这里发送任意消息即可开始新的 TeleCodex 会话。",
       ]
         .filter((line): line is string => line !== undefined)
         .join("\n");
 
       const html = [
-        "<b>🔄 Thread handed back to Codex CLI.</b>",
+        "<b>🔄 会话已交还给 Codex CLI。</b>",
         "",
-        "Run this in your terminal:",
+        "请在终端运行：",
         `<pre>${escapeHTML(resumeCommand)}</pre>`,
         copiedToClipboard ? "" : undefined,
-        copiedToClipboard ? "📋 <i>Command copied to clipboard!</i>" : undefined,
+        copiedToClipboard ? "📋 <i>命令已复制到剪贴板！</i>" : undefined,
         "",
-        "Send any message here to start a new TeleCodex thread.",
+        "在这里发送任意消息即可开始新的 TeleCodex 会话。",
       ]
         .filter((line): line is string => line !== undefined)
         .join("\n");
 
       await safeReply(ctx, html, { fallbackText: plainText });
     } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `失败：${friendlyErrorText(error)}`,
       });
     }
   });
@@ -1256,8 +1624,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot attach while a prompt is running."), {
-        fallbackText: "Cannot attach while a prompt is running.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法绑定会话。"), {
+        fallbackText: "当前提问仍在处理中，无法绑定会话。",
       });
       return;
     }
@@ -1266,15 +1634,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const threadId = rawText.replace(/^\/attach(?:@\w+)?\s*/, "").trim();
 
     if (!threadId) {
-      await safeReply(ctx, escapeHTML("Usage: /attach <thread-id>"), {
-        fallbackText: "Usage: /attach <thread-id>",
+      await safeReply(ctx, escapeHTML("用法：/attach <会话 ID>"), {
+        fallbackText: "用法：/attach <会话 ID>",
       });
       return;
     }
 
     if (!getThread(threadId)) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(`Unknown Codex thread: ${threadId}`)}`, {
-        fallbackText: `Failed: Unknown Codex thread: ${threadId}`,
+      await safeReply(ctx, `<b>失败：</b>${escapeHTML(`未知的 Codex 会话：${threadId}`)}`, {
+        fallbackText: `失败：未知的 Codex 会话：${threadId}`,
       });
       return;
     }
@@ -1284,12 +1652,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.switchSession(threadId);
       updateSessionMetadata(contextKey, session);
-      const html = `<b>Attached to thread.</b>\n\n${renderSessionInfoHTML(info)}`;
-      const plain = `Attached to thread.\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>已绑定到会话。</b>\n\n${renderSessionInfoHTML(info)}`;
+      const plain = `已绑定到会话。\n\n${renderSessionInfoPlain(info)}`;
       await safeReply(ctx, html, { fallbackText: plain });
     } catch (error) {
-      await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `失败：${friendlyErrorText(error)}`,
       });
     } finally {
       busyState.switching = false;
@@ -1309,8 +1677,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot switch sessions while a prompt is running."), {
-        fallbackText: "Cannot switch sessions while a prompt is running.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法切换会话。"), {
+        fallbackText: "当前提问仍在处理中，无法切换会话。",
       });
       return;
     }
@@ -1324,12 +1692,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       try {
         const info = await session.switchSession(threadId);
         updateSessionMetadata(contextKey, session);
-        const html = `<b>Switched thread.</b>\n\n${renderSessionInfoHTML(info)}`;
-        const plain = `Switched thread.\n\n${renderSessionInfoPlain(info)}`;
+        const html = `<b>已切换会话。</b>\n\n${renderSessionInfoHTML(info)}`;
+        const plain = `已切换会话。\n\n${renderSessionInfoPlain(info)}`;
         await safeReply(ctx, html, { fallbackText: plain });
       } catch (error) {
-        await safeReply(ctx, `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-          fallbackText: `Failed: ${friendlyErrorText(error)}`,
+        await safeReply(ctx, `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+          fallbackText: `失败：${friendlyErrorText(error)}`,
         });
       } finally {
         busyState.switching = false;
@@ -1339,8 +1707,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const sessions = session.listAllSessions(50);
     if (sessions.length === 0) {
-      await safeReply(ctx, escapeHTML("No recent threads found."), {
-        fallbackText: "No recent threads found.",
+      await safeReply(ctx, escapeHTML("未找到最近的会话。"), {
+        fallbackText: "未找到最近的会话。",
       });
       return;
     }
@@ -1382,8 +1750,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingSessionButtons.set(contextKey, sessionButtons);
     const keyboard = paginateKeyboard(sessionButtons, 0, "sess");
 
-    await safeReply(ctx, `<b>Recent threads</b> (${orderedSessions.length}):\nTap to switch.`, {
-      fallbackText: `Recent threads (${orderedSessions.length}):\nTap to switch.`,
+    await safeReply(ctx, `<b>最近会话</b>（${orderedSessions.length} 个）：\n点击即可切换。`, {
+      fallbackText: `最近会话（${orderedSessions.length} 个）：\n点击即可切换。`,
       replyMarkup: keyboard,
     });
   });
@@ -1401,21 +1769,21 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     if (isBusy(contextKey)) {
-      await safeReply(ctx, escapeHTML("Cannot change model while a prompt is running."), {
-        fallbackText: "Cannot change model while a prompt is running.",
+      await safeReply(ctx, escapeHTML("当前提问仍在处理中，无法切换模型。"), {
+        fallbackText: "当前提问仍在处理中，无法切换模型。",
       });
       return;
     }
 
     const models = session.listModels();
     if (models.length === 0) {
-      await safeReply(ctx, escapeHTML("No models available."), {
-        fallbackText: "No models available.",
+      await safeReply(ctx, escapeHTML("没有可用模型。"), {
+        fallbackText: "没有可用模型。",
       });
       return;
     }
 
-    const currentModel = session.getInfo().model ?? "(default)";
+    const currentModel = session.getInfo().model ?? "（默认）";
     const modelButtons = models.map((model) => ({
       label: `${model.displayName}${model.slug === currentModel ? " ✓" : ""}`,
       callbackData: `model_${model.slug}`,
@@ -1425,9 +1793,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     await safeReply(
       ctx,
-      [`<b>Current model:</b> <code>${escapeHTML(currentModel)}</code>`, "", "Select a model for new threads:"].join("\n"),
+      [`<b>当前模型：</b><code>${escapeHTML(currentModel)}</code>`, "", "请选择用于新会话的模型："].join("\n"),
       {
-        fallbackText: [`Current model: ${currentModel}`, "", "Select a model for new threads:"].join("\n"),
+        fallbackText: [`当前模型：${currentModel}`, "", "请选择用于新会话的模型："].join("\n"),
         replyMarkup: keyboard,
       },
     );
@@ -1454,8 +1822,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingEffortButtons.set(contextKey, effortButtons);
     const keyboard = paginateKeyboard(effortButtons, 0, "effort");
     const text = current
-      ? `<b>Reasoning effort:</b> <code>${escapeHTML(current)}</code>\n\nSelect for new threads:`
-      : "<b>Reasoning effort:</b> not set (model default)\n\nSelect for new threads:";
+      ? `<b>推理强度：</b><code>${escapeHTML(current)}</code>\n\n请选择用于新会话的推理强度：`
+      : "<b>推理强度：</b>未设置（使用模型默认值）\n\n请选择用于新会话的推理强度：";
     await safeReply(ctx, text, {
       fallbackText: text.replace(/<[^>]+>/g, ""),
       replyMarkup: keyboard,
@@ -1465,16 +1833,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
-  handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "Expired, run /sessions again");
-  handlePageCallback(/^ws_page_(\d+)$/, "ws", pendingWorkspaceButtons, "Expired, run /new again");
+  handlePageCallback(/^sess_page_(\d+)$/, "sess", pendingSessionButtons, "已过期，请重新运行 /sessions");
+  handlePageCallback(/^ws_page_(\d+)$/, "ws", pendingWorkspaceButtons, "已过期，请重新运行 /new");
   handlePageCallback(
     /^launch_page_(\d+)$/,
     "launch",
     pendingLaunchButtons,
-    `Expired, run ${LAUNCH_PROFILES_COMMAND} again`,
+    `已过期，请重新运行 ${LAUNCH_PROFILES_COMMAND}`,
   );
-  handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
-  handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /effort again");
+  handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "已过期，请重新运行 /model");
+  handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "已过期，请重新运行 /effort");
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
     const contextKey = ctx.match?.[1];
@@ -1485,12 +1853,185 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const session = registry.get(contextKey);
     if (!session) {
-      await ctx.answerCallbackQuery({ text: "Nothing to abort" });
+      await ctx.answerCallbackQuery({ text: "没有可取消的操作" });
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: "Aborting..." });
+    await ctx.answerCallbackQuery({ text: "正在取消……" });
     await session.abort();
+    clearPlanInteractionState(contextKey, new Error("操作已取消。"));
+  });
+
+  bot.callbackQuery("ws_new_path", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) return;
+
+    const { contextKey } = contextSession;
+    if (isBusy(contextKey)) {
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
+      return;
+    }
+
+    pendingWorkspacePathRequests.add(contextKey);
+    pendingWorkspacePicks.delete(contextKey);
+    pendingWorkspaceButtons.delete(contextKey);
+    await ctx.answerCallbackQuery({ text: "请发送文件夹绝对路径" });
+    await safeReply(ctx, [
+      "<b>请发送新工作区的绝对路径：</b>",
+      "例如：<code>C:\\Projects\\demo</code>、<code>D:\\</code>、<code>/workspace/demo</code> 或 <code>/</code>。",
+      "路径不存在时会自动创建。",
+    ].join("\n"), {
+      fallbackText: "请发送新工作区的绝对路径，例如 C:\\Projects\\demo、D:\\、/workspace/demo 或 /。路径不存在时会自动创建。",
+    });
+  });
+
+  bot.callbackQuery(/^plan_confirm:([\w-]+)$/, async (ctx) => {
+    const actionId = ctx.match?.[1];
+    const action = actionId ? pendingPlanActions.get(actionId) : undefined;
+    if (!action) {
+      await ctx.answerCallbackQuery({ text: "计划已更新，请使用最新的按钮" });
+      return;
+    }
+    if (!action.confirm) {
+      await ctx.answerCallbackQuery({ text: "当前没有可确认的计划，请重新生成" });
+      return;
+    }
+
+    const busyState = getBusyState(action.contextKey);
+    if (busyState.processing) {
+      await ctx.answerCallbackQuery({ text: "计划仍在生成中，请稍候再确认" });
+      return;
+    }
+
+    pendingPlanActions.delete(actionId!);
+    planMessages.delete(action.contextKey);
+    await ctx.answerCallbackQuery({ text: "正在执行此计划……" });
+    await bot.api.editMessageReplyMarkup(ctx.chat!.id, action.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {});
+    busyState.processing = true;
+    void action.confirm()
+      .catch((error) => console.error("确认 Plan Mode 计划失败", error))
+      .finally(() => {
+        busyState.processing = false;
+      });
+  });
+
+  bot.callbackQuery(/^plan_regenerate:([\w-]+)$/, async (ctx) => {
+    const actionId = ctx.match?.[1];
+    const action = actionId ? pendingPlanActions.get(actionId) : undefined;
+    if (!action?.regenerate) {
+      await ctx.answerCallbackQuery({ text: "计划已更新，请使用最新的按钮" });
+      return;
+    }
+
+    const busyState = getBusyState(action.contextKey);
+    if (busyState.processing) {
+      await ctx.answerCallbackQuery({ text: "计划仍在生成中，请稍候再试" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "正在重新生成计划……" });
+    busyState.processing = true;
+    void action.regenerate()
+      .catch((error) => console.error("重新生成 Plan Mode 计划失败", error))
+      .finally(() => {
+        busyState.processing = false;
+      });
+  });
+
+  bot.callbackQuery(/^plan_steer:([\w-]+)$/, async (ctx) => {
+    const actionId = ctx.match?.[1];
+    const action = actionId ? pendingPlanActions.get(actionId) : undefined;
+    if (!action) {
+      await ctx.answerCallbackQuery({ text: "计划已更新，请使用最新的按钮" });
+      return;
+    }
+
+    if (getBusyState(action.contextKey).processing) {
+      await ctx.answerCallbackQuery({ text: "计划仍在生成中，请稍候再修改" });
+      return;
+    }
+
+    pendingPlanSteers.set(action.contextKey, action);
+    pendingPlanTextRequests.set(action.contextKey, actionId!);
+    await ctx.answerCallbackQuery({ text: "请发送要修改或补充的内容" });
+    await safeReply(ctx, "请发送对计划的修改或补充内容。", {
+      fallbackText: "请发送对计划的修改或补充内容。",
+    });
+  });
+
+  bot.callbackQuery(/^plan_cancel:([\w-]+)$/, async (ctx) => {
+    const actionId = ctx.match?.[1];
+    const action = actionId ? pendingPlanActions.get(actionId) : undefined;
+    if (!action) {
+      await ctx.answerCallbackQuery({ text: "计划已结束或已更新" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "正在取消……" });
+    clearPlanInteractionState(action.contextKey, new Error("Plan Mode 已取消。"));
+    planModeContexts.delete(action.contextKey);
+    await action.cancel().catch((error) => console.error("取消 Plan Mode 失败", error));
+    await bot.api.editMessageReplyMarkup(ctx.chat!.id, action.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {});
+  });
+
+  bot.callbackQuery(/^plan_answer:([\w-]+):(\d+)$/, async (ctx) => {
+    const requestId = ctx.match?.[1];
+    const optionIndex = Number.parseInt(ctx.match?.[2] ?? "", 10);
+    const pending = requestId ? pendingPlanInputs.get(requestId) : undefined;
+    const option = pending?.question.options?.[optionIndex];
+    if (!pending || !option) {
+      await ctx.answerCallbackQuery({ text: "问题已过期，请等待下一步" });
+      return;
+    }
+
+    pendingPlanInputs.delete(requestId!);
+    await ctx.answerCallbackQuery({ text: "已记录" });
+    pending.resolve(option.label);
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (ctx.chat?.id && messageId) {
+      await safeEditMessage(bot, ctx.chat.id, messageId, `<b>已选择：</b>${escapeHTML(option.label)}`, {
+        fallbackText: `已选择：${option.label}`,
+      }).catch(() => {});
+    }
+  });
+
+  bot.callbackQuery(/^plan_other:([\w-]+)$/, async (ctx) => {
+    const requestId = ctx.match?.[1];
+    const pending = requestId ? pendingPlanInputs.get(requestId) : undefined;
+    if (!pending) {
+      await ctx.answerCallbackQuery({ text: "问题已过期，请等待下一步" });
+      return;
+    }
+
+    pendingPlanTextRequests.set(pending.contextKey, requestId!);
+    await ctx.answerCallbackQuery({ text: "请发送自定义回答" });
+    await safeReply(ctx, "请发送你的自定义回答。", { fallbackText: "请发送你的自定义回答。" });
+  });
+
+  bot.callbackQuery(/^plan_approve:([\w-]+):(accept|acceptForSession|decline)$/, async (ctx) => {
+    const actionId = ctx.match?.[1];
+    const decision = ctx.match?.[2];
+    const pending = actionId ? pendingPlanDecisions.get(actionId) : undefined;
+    if (!pending || !decision) {
+      await ctx.answerCallbackQuery({ text: "审批已过期" });
+      return;
+    }
+
+    pendingPlanDecisions.delete(actionId!);
+    await ctx.answerCallbackQuery({ text: decision === "decline" ? "已拒绝" : "已允许" });
+    if (pending.request.kind === "permissions") {
+      pending.resolve({
+        permissions: decision === "decline" ? {} : pending.request.permissions,
+        scope: decision === "acceptForSession" ? "session" : "turn",
+      });
+    } else {
+      pending.resolve({ decision });
+    }
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (ctx.chat?.id && messageId) {
+      const label = decision === "decline" ? "❌ 已拒绝" : decision === "acceptForSession" ? "✅ 已允许本次会话" : "✅ 已允许一次";
+      await safeEditMessage(bot, ctx.chat.id, messageId, label, { fallbackText: label }).catch(() => {});
+    }
   });
 
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
@@ -1511,16 +2052,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const threadIds = pendingSessionPicks.get(contextKey);
     const threadId = threadIds?.[index];
     if (!threadId) {
-      await ctx.answerCallbackQuery({ text: "Session expired, run /sessions again" });
+      await ctx.answerCallbackQuery({ text: "会话列表已过期，请重新运行 /sessions" });
       return;
     }
 
     if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: "Switching..." });
+    await ctx.answerCallbackQuery({ text: "正在切换……" });
     pendingSessionPicks.delete(contextKey);
     pendingSessionButtons.delete(contextKey);
 
@@ -1529,8 +2070,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.switchSession(threadId);
       updateSessionMetadata(contextKey, session);
-      const plainText = `Switched session.\n\n${renderSessionInfoPlain(info)}`;
-      const html = `<b>Switched session.</b>\n\n${renderSessionInfoHTML(info)}`;
+      const plainText = `已切换会话。\n\n${renderSessionInfoPlain(info)}`;
+      const html = `<b>已切换会话。</b>\n\n${renderSessionInfoHTML(info)}`;
 
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
@@ -1538,8 +2079,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(ctx, html, { fallbackText: plainText });
       }
     } catch (error) {
-      const errHtml = `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`;
-      const errPlain = `Failed: ${friendlyErrorText(error)}`;
+      const errHtml = `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`;
+      const errPlain = `失败：${friendlyErrorText(error)}`;
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: errPlain });
       } else {
@@ -1568,16 +2109,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const workspaces = pendingWorkspacePicks.get(contextKey);
     const workspace = workspaces?.[index];
     if (!workspace) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /new again" });
+      await ctx.answerCallbackQuery({ text: "操作已过期，请重新运行 /new" });
       return;
     }
 
     if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: "Creating thread..." });
+    await ctx.answerCallbackQuery({ text: "正在创建会话……" });
     pendingWorkspacePicks.delete(contextKey);
     pendingWorkspaceButtons.delete(contextKey);
 
@@ -1586,7 +2127,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     try {
       const info = await session.newThread(workspace);
       updateSessionMetadata(contextKey, session);
-      const label = isTopicContext(contextKey) ? "New thread created for this topic." : "New thread created.";
+      const label = isTopicContext(contextKey) ? "已为当前话题新建会话。" : "已新建会话。";
       const plainText = `${label}\n\n${renderSessionInfoPlain(info)}`;
       const html = `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`;
 
@@ -1596,8 +2137,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(ctx, html, { fallbackText: plainText });
       }
     } catch (error) {
-      const errHtml = `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`;
-      const errPlain = `Failed: ${friendlyErrorText(error)}`;
+      const errHtml = `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`;
+      const errPlain = `失败：${friendlyErrorText(error)}`;
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: errPlain });
       } else {
@@ -1626,19 +2167,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const launchProfileIds = pendingLaunchPicks.get(contextKey);
     const profileId = launchProfileIds?.[index];
     if (!profileId) {
-      await ctx.answerCallbackQuery({ text: `Expired, run ${LAUNCH_PROFILES_COMMAND} again` });
+      await ctx.answerCallbackQuery({ text: `操作已过期，请重新运行 ${LAUNCH_PROFILES_COMMAND}` });
       return;
     }
 
     if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
       return;
     }
 
     const profile = findLaunchProfile(config.launchProfiles, profileId);
     if (!profile) {
       clearLaunchSelectionState(contextKey);
-      await ctx.answerCallbackQuery({ text: "Launch profile no longer exists" });
+      await ctx.answerCallbackQuery({ text: "启动配置已不存在" });
       return;
     }
 
@@ -1647,24 +2188,24 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       pendingLaunchPicks.delete(contextKey);
       pendingLaunchButtons.delete(contextKey);
 
-      await ctx.answerCallbackQuery({ text: "Confirm danger-full-access" });
+      await ctx.answerCallbackQuery({ text: "请确认 danger-full-access" });
       const confirmKeyboard = new InlineKeyboard()
-        .text("Enable danger-full-access", `launchconfirm_yes:${profile.id}`)
+        .text("启用 danger-full-access", `launchconfirm_yes:${profile.id}`)
         .row()
-        .text("Cancel", `launchconfirm_no:${profile.id}`);
+        .text("取消", `launchconfirm_no:${profile.id}`);
       const html = [
-        `<b>Confirm launch profile:</b> <code>${escapeHTML(profile.label)}</code>`,
-        `<b>Behavior:</b> <code>${escapeHTML(formatLaunchProfileBehavior(profile))}</code>`,
+        `<b>确认启动配置：</b><code>${escapeHTML(profile.label)}</code>`,
+        `<b>行为：</b><code>${escapeHTML(formatLaunchProfileBehavior(profile))}</code>`,
         "",
-        "⚠️ <b>This profile uses danger-full-access.</b>",
-        "It will apply to new or reattached threads in this Telegram context.",
+        "⚠️ <b>此配置使用 danger-full-access。</b>",
+        "它将应用于当前 Telegram 上下文中新建或重新绑定的会话。",
       ].join("\n");
       const plain = [
-        `Confirm launch profile: ${profile.label}`,
-        `Behavior: ${formatLaunchProfileBehavior(profile)}`,
+        `确认启动配置：${profile.label}`,
+        `行为：${formatLaunchProfileBehavior(profile)}`,
         "",
-        "WARNING: This profile uses danger-full-access.",
-        "It will apply to new or reattached threads in this Telegram context.",
+        "警告：此配置使用 danger-full-access。",
+        "它将应用于当前 Telegram 上下文中新建或重新绑定的会话。",
       ].join("\n");
 
       if (messageId) {
@@ -1681,7 +2222,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: `Launch set to ${profile.label}` });
+    await ctx.answerCallbackQuery({ text: `已设置启动配置：${profile.label}` });
     clearLaunchSelectionState(contextKey);
     const selectedProfile = session.setLaunchProfile(profile.id);
     updateSessionMetadata(contextKey, session);
@@ -1724,41 +2265,41 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const { contextKey, session } = contextSession;
     const profileId = pendingUnsafeLaunchConfirmations.get(contextKey);
     if (!profileId || profileId !== confirmedProfileId) {
-      await ctx.answerCallbackQuery({ text: `Expired, run ${LAUNCH_PROFILES_COMMAND} again` });
+      await ctx.answerCallbackQuery({ text: `操作已过期，请重新运行 ${LAUNCH_PROFILES_COMMAND}` });
       return;
     }
 
     if (action === "no") {
       clearLaunchSelectionState(contextKey);
-      await ctx.answerCallbackQuery({ text: "Cancelled" });
+      await ctx.answerCallbackQuery({ text: "已取消" });
       await safeEditMessage(
         bot,
         chatId,
         messageId,
-        `<b>Launch change cancelled.</b>\n\nRun ${LAUNCH_PROFILES_COMMAND} again to pick another profile.`,
+        `<b>已取消启动配置更改。</b>\n\n请重新运行 ${LAUNCH_PROFILES_COMMAND} 选择其他配置。`,
         {
-          fallbackText: `Launch change cancelled.\n\nRun ${LAUNCH_PROFILES_COMMAND} again to pick another profile.`,
+          fallbackText: `已取消启动配置更改。\n\n请重新运行 ${LAUNCH_PROFILES_COMMAND} 选择其他配置。`,
         },
       );
       return;
     }
 
     if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
       return;
     }
 
     const profile = findLaunchProfile(config.launchProfiles, profileId);
     if (!profile) {
       clearLaunchSelectionState(contextKey);
-      await ctx.answerCallbackQuery({ text: "Launch profile no longer exists" });
+      await ctx.answerCallbackQuery({ text: "启动配置已不存在" });
       await safeEditMessage(
         bot,
         chatId,
         messageId,
-        `<b>Launch profile expired.</b>\n\nRun ${LAUNCH_PROFILES_COMMAND} again.`,
+        `<b>启动配置已过期。</b>\n\n请重新运行 ${LAUNCH_PROFILES_COMMAND}。`,
         {
-          fallbackText: `Launch profile expired.\n\nRun ${LAUNCH_PROFILES_COMMAND} again.`,
+          fallbackText: `启动配置已过期。\n\n请重新运行 ${LAUNCH_PROFILES_COMMAND}。`,
         },
       );
       return;
@@ -1767,19 +2308,19 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     clearLaunchSelectionState(contextKey);
     const selectedProfile = session.setLaunchProfile(profile.id);
     updateSessionMetadata(contextKey, session);
-    await ctx.answerCallbackQuery({ text: `Launch set to ${selectedProfile.label}` });
+    await ctx.answerCallbackQuery({ text: `已设置启动配置：${selectedProfile.label}` });
 
     const html = [
-      `<b>Launch profile set to</b> <code>${escapeHTML(selectedProfile.label)}</code>`,
-      `<b>Behavior:</b> <code>${escapeHTML(formatLaunchProfileBehavior(selectedProfile))}</code>`,
+      `<b>已设置启动配置：</b><code>${escapeHTML(selectedProfile.label)}</code>`,
+      `<b>行为：</b><code>${escapeHTML(formatLaunchProfileBehavior(selectedProfile))}</code>`,
       "",
-      "⚠️ <i>danger-full-access confirmed for new or reattached threads.</i>",
+      "⚠️ <i>已确认对新建或重新绑定的会话使用 danger-full-access。</i>",
     ].join("\n");
     const plain = [
-      `Launch profile set to ${selectedProfile.label}`,
-      `Behavior: ${formatLaunchProfileBehavior(selectedProfile)}`,
+      `已设置启动配置：${selectedProfile.label}`,
+      `行为：${formatLaunchProfileBehavior(selectedProfile)}`,
       "",
-      "danger-full-access confirmed for new or reattached threads.",
+      "已确认对新建或重新绑定的会话使用 danger-full-access。",
     ].join("\n");
 
     await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plain });
@@ -1802,29 +2343,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const { contextKey, session } = contextSession;
     const buttons = pendingModelButtons.get(contextKey);
     if (!buttons) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /model again" });
+      await ctx.answerCallbackQuery({ text: "操作已过期，请重新运行 /model" });
       return;
     }
 
     const modelExists = buttons.some((button) => button.callbackData === `model_${slug}`);
     if (!modelExists) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /model again" });
+      await ctx.answerCallbackQuery({ text: "操作已过期，请重新运行 /model" });
       return;
     }
 
     if (isBusy(contextKey)) {
-      await ctx.answerCallbackQuery({ text: "Wait for the current prompt to finish" });
+      await ctx.answerCallbackQuery({ text: "请等待当前提问完成" });
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: "Setting model..." });
+    await ctx.answerCallbackQuery({ text: "正在设置模型……" });
     pendingModelButtons.delete(contextKey);
 
     try {
       const model = session.setModel(slug);
       updateSessionMetadata(contextKey, session);
-      const html = `<b>Model set to</b> <code>${escapeHTML(model)}</code> — applies to new threads.`;
-      const plainText = `Model set to ${model} — applies to new threads.`;
+      const html = `<b>已设置模型：</b><code>${escapeHTML(model)}</code>（对新会话生效）。`;
+      const plainText = `已设置模型：${model}（对新会话生效）。`;
 
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, html, { fallbackText: plainText });
@@ -1832,8 +2373,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         await safeReply(ctx, html, { fallbackText: plainText });
       }
     } catch (error) {
-      const errHtml = `<b>Failed:</b> ${escapeHTML(friendlyErrorText(error))}`;
-      const errPlain = `Failed: ${friendlyErrorText(error)}`;
+      const errHtml = `<b>失败：</b>${escapeHTML(friendlyErrorText(error))}`;
+      const errPlain = `失败：${friendlyErrorText(error)}`;
       if (messageId) {
         await safeEditMessage(bot, chatId, messageId, errHtml, { fallbackText: errPlain });
       } else {
@@ -1859,17 +2400,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const { contextKey, session } = contextSession;
     const buttons = pendingEffortButtons.get(contextKey);
     if (!buttons || !buttons.some((button) => button.callbackData === `effort_${effort}`)) {
-      await ctx.answerCallbackQuery({ text: "Expired, run /effort again" });
+      await ctx.answerCallbackQuery({ text: "操作已过期，请重新运行 /effort" });
       return;
     }
 
-    await ctx.answerCallbackQuery({ text: `Effort set to ${effort}` });
+    await ctx.answerCallbackQuery({ text: `已设置推理强度：${effort}` });
     pendingEffortButtons.delete(contextKey);
     session.setReasoningEffort(effort);
     updateSessionMetadata(contextKey, session);
-    const html = `⚡ Reasoning effort set to <code>${escapeHTML(effort)}</code> — applies to new threads.`;
+    const html = `⚡ 已设置推理强度：<code>${escapeHTML(effort)}</code>（对新会话生效）。`;
     await safeEditMessage(bot, chatId, messageId, html, {
-      fallbackText: `⚡ Reasoning effort set to ${effort} — applies to new threads.`,
+      fallbackText: `⚡ 已设置推理强度：${effort}（对新会话生效）。`,
     });
   });
 
@@ -1880,15 +2421,75 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     const userText = ctx.message.text.trim();
-    if (!userText || userText.startsWith("/")) {
+    if (!userText) {
       return;
     }
 
     const { contextKey, session } = contextSession;
+
+    if (pendingWorkspacePathRequests.has(contextKey)) {
+      if (isBusy(contextKey)) {
+        await sendBusyReply(ctx);
+        return;
+      }
+
+      const busyState = getBusyState(contextKey);
+      busyState.switching = true;
+      try {
+        const workspace = await ensureWorkspaceDirectory(userText);
+        const info = await session.newThread(workspace);
+        pendingWorkspacePathRequests.delete(contextKey);
+        clearPlanInteractionState(contextKey, new Error("已新建工作区会话。"));
+        updateSessionMetadata(contextKey, session);
+        const label = isTopicContext(contextKey) ? "已为当前话题新建会话。" : "已新建会话。";
+        await safeReply(ctx, `<b>${escapeHTML(label)}</b>\n\n${renderSessionInfoHTML(info)}`, {
+          fallbackText: `${label}\n\n${renderSessionInfoPlain(info)}`,
+        });
+      } catch (error) {
+        await safeReply(ctx, `<b>无法创建工作区：</b>${escapeHTML(friendlyErrorText(error))}\n\n请重新发送绝对路径，或使用 /new 重新选择。`, {
+          fallbackText: `无法创建工作区：${friendlyErrorText(error)}\n\n请重新发送绝对路径，或使用 /new 重新选择。`,
+        });
+      } finally {
+        busyState.switching = false;
+      }
+      return;
+    }
+
+    if (userText.startsWith("/")) {
+      return;
+    }
+
+    const pendingTextRequest = pendingPlanTextRequests.get(contextKey);
+    if (pendingTextRequest) {
+      const pendingInput = pendingPlanInputs.get(pendingTextRequest);
+      if (pendingInput) {
+        pendingPlanTextRequests.delete(contextKey);
+        pendingPlanInputs.delete(pendingTextRequest);
+        pendingInput.resolve(userText);
+        await safeReply(ctx, "<b>已记录你的回答。</b>", { fallbackText: "已记录你的回答。" });
+        return;
+      }
+
+      const steer = pendingPlanSteers.get(contextKey);
+      if (steer) {
+        pendingPlanTextRequests.delete(contextKey);
+        pendingPlanSteers.delete(contextKey);
+        await safeReply(ctx, "<b>正在根据你的补充更新计划……</b>", { fallbackText: "正在根据你的补充更新计划……" });
+        void steer.steer(userText).catch((error) => console.error("更新 Plan Mode 计划失败", error));
+        return;
+      }
+
+      pendingPlanTextRequests.delete(contextKey);
+    }
+
     lastPromptInput.set(contextKey, userText);
     await setReaction(ctx, "👀");
     try {
-      await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+      if (planModeContexts.has(contextKey)) {
+        await handlePlanPrompt(ctx, contextKey, ctx.chat.id, session, userText, "start");
+      } else {
+        await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+      }
       await setReaction(ctx, "👍");
     } catch {
       await clearReaction(ctx);
@@ -1925,8 +2526,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const result = await transcribeAudio(tempFilePath);
       transcript = result.text.trim();
       if (!transcript) {
-        await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
-          fallbackText: "Transcription was empty. Please try again or send text instead.",
+        await safeReply(ctx, escapeHTML("未识别到语音内容。请重试，或直接发送文字。"), {
+          fallbackText: "未识别到语音内容。请重试，或直接发送文字。",
         });
         return;
       }
@@ -1934,13 +2535,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const preview = trimLine(transcript.replace(/\s+/g, " "), 100);
       await safeReply(
         ctx,
-        `🎙️ <b>Transcribed:</b> ${escapeHTML(preview)} <i>(via ${escapeHTML(result.backend)})</i>`,
-        { fallbackText: `🎙️ Transcribed: ${preview} (via ${result.backend})` },
+        `🎙️ <b>转写结果：</b>${escapeHTML(preview)} <i>（通过 ${escapeHTML(result.backend)}）</i>`,
+        { fallbackText: `🎙️ 转写结果：${preview}（通过 ${result.backend}）` },
       );
     } catch (error) {
-      const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
-      await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
-        fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
+      const note = "提示：语音转写使用 OPENAI_API_KEY，而不是 CODEX_API_KEY。";
+      await safeReply(ctx, `<b>语音转写失败：</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
+        fallbackText: `语音转写失败：\n${friendlyErrorText(error)}\n\n${note}`,
       });
       return;
     } finally {
@@ -1991,8 +2592,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.api.sendChatAction(chatId, "upload_photo");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, photo.file_id, 20 * 1024 * 1024);
     } catch (error) {
-      await safeReply(ctx, `<b>Failed to download photo:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to download photo: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>下载图片失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `下载图片失败：${friendlyErrorText(error)}`,
       });
       return;
     } finally {
@@ -2040,8 +2641,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (doc.file_size && doc.file_size > config.maxFileSize) {
       const sizeMB = Math.round(doc.file_size / 1024 / 1024);
       const maxMB = Math.round(config.maxFileSize / 1024 / 1024);
-      await safeReply(ctx, `<b>File too large</b> (${sizeMB} MB, max ${maxMB} MB)`, {
-        fallbackText: `File too large (${sizeMB} MB, max ${maxMB} MB)`,
+      await safeReply(ctx, `<b>文件过大</b>（${sizeMB} MB，最大 ${maxMB} MB）`, {
+        fallbackText: `文件过大（${sizeMB} MB，最大 ${maxMB} MB）`,
       });
       return;
     }
@@ -2054,8 +2655,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, doc.file_id, config.maxFileSize);
     } catch (error) {
-      await safeReply(ctx, `<b>Failed to download file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to download file: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>下载文件失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `下载文件失败：${friendlyErrorText(error)}`,
       });
       return;
     } finally {
@@ -2076,8 +2677,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         maxFileSize: config.maxFileSize,
       });
     } catch (error) {
-      await safeReply(ctx, `<b>Failed to stage file:</b> ${escapeHTML(friendlyErrorText(error))}`, {
-        fallbackText: `Failed to stage file: ${friendlyErrorText(error)}`,
+      await safeReply(ctx, `<b>暂存文件失败：</b>${escapeHTML(friendlyErrorText(error))}`, {
+        fallbackText: `暂存文件失败：${friendlyErrorText(error)}`,
       });
       return;
     } finally {
@@ -2086,8 +2687,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       }
     }
 
-    await safeReply(ctx, `📎 <b>Received:</b> <code>${escapeHTML(stagedFile.safeName)}</code>`, {
-      fallbackText: `📎 Received: ${stagedFile.safeName}`,
+    await safeReply(ctx, `📎 <b>已收到：</b><code>${escapeHTML(stagedFile.safeName)}</code>`, {
+      fallbackText: `📎 已收到：${stagedFile.safeName}`,
     });
 
     // Keep typing visible during the gap between staging and prompt execution
@@ -2133,36 +2734,37 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
-    { command: "start", description: "Welcome & status" },
-    { command: "help", description: "Command reference" },
-    { command: "new", description: "Start a new thread" },
-    { command: "session", description: "Current thread details" },
-    { command: "sessions", description: "Browse & switch threads" },
-    { command: "retry", description: "Resend the last prompt" },
-    { command: "abort", description: "Cancel current operation" },
-    { command: "launch_profiles", description: "Select launch profile" },
-    { command: "model", description: "View & change model" },
-    { command: "effort", description: "Set reasoning effort" },
-    { command: "auth", description: "Check auth status" },
-    { command: "login", description: "Start authentication" },
-    { command: "logout", description: "Sign out" },
-    { command: "voice", description: "Voice transcription status" },
-    { command: "handback", description: "Hand thread to Codex CLI" },
-    { command: "attach", description: "Bind a Codex thread to this topic" },
-    { command: "switch", description: "Switch to a thread by ID" },
+    { command: "start", description: "欢迎与状态" },
+    { command: "help", description: "命令说明" },
+    { command: "new", description: "新建会话" },
+    { command: "plan", description: "切换 Plan Mode" },
+    { command: "session", description: "当前会话详情" },
+    { command: "sessions", description: "浏览并切换会话" },
+    { command: "retry", description: "重新发送上一条提问" },
+    { command: "abort", description: "取消当前操作" },
+    { command: "launch_profiles", description: "选择启动配置" },
+    { command: "model", description: "查看并切换模型" },
+    { command: "effort", description: "设置推理强度" },
+    { command: "auth", description: "检查认证状态" },
+    { command: "login", description: "开始认证" },
+    { command: "logout", description: "退出登录" },
+    { command: "voice", description: "语音转写状态" },
+    { command: "handback", description: "将会话交还给 Codex CLI" },
+    { command: "attach", description: "将 Codex 会话绑定到当前话题" },
+    { command: "switch", description: "按 ID 切换会话" },
   ]);
 }
 
 function renderSessionInfoPlain(info: CodexSessionInfo): string {
   return [
-    `Thread ID: ${info.threadId ?? "(not started yet)"}`,
-    `Workspace: ${info.workspace}`,
-    `Launch profile: ${info.launchProfileLabel} (${info.launchProfileBehavior})${info.unsafeLaunch ? " [unsafe]" : ""}`,
+    `会话 ID：${info.threadId ?? "（尚未启动）"}`,
+    `工作区：${info.workspace}`,
+    `启动配置：${info.launchProfileLabel}（${info.launchProfileBehavior}）${info.unsafeLaunch ? " [不安全]" : ""}`,
     info.nextLaunchProfileId
-      ? `Next launch profile: ${info.nextLaunchProfileLabel} (${info.nextLaunchProfileBehavior})${info.nextUnsafeLaunch ? " [unsafe]" : ""}`
+      ? `下次启动配置：${info.nextLaunchProfileLabel}（${info.nextLaunchProfileBehavior}）${info.nextUnsafeLaunch ? " [不安全]" : ""}`
       : undefined,
-    info.model ? `Model: ${info.model}` : undefined,
-    info.reasoningEffort ? `Reasoning effort: ${info.reasoningEffort}` : undefined,
+    info.model ? `模型：${info.model}` : undefined,
+    info.reasoningEffort ? `推理强度：${info.reasoningEffort}` : undefined,
     info.sessionTokens ? formatSessionTokensPlain(info.sessionTokens) : undefined,
   ]
     .filter((line): line is string => Boolean(line))
@@ -2171,34 +2773,34 @@ function renderSessionInfoPlain(info: CodexSessionInfo): string {
 
 function renderSessionInfoHTML(info: CodexSessionInfo): string {
   return [
-    `<b>Thread ID:</b> <code>${escapeHTML(info.threadId ?? "(not started yet)")}</code>`,
-    `<b>Workspace:</b> <code>${escapeHTML(info.workspace)}</code>`,
-    `<b>Launch profile:</b> <code>${escapeHTML(info.launchProfileLabel)}</code>`,
-    `<b>Launch behavior:</b> <code>${escapeHTML(info.launchProfileBehavior)}</code>${info.unsafeLaunch ? " ⚠️" : ""}`,
+    `<b>会话 ID：</b><code>${escapeHTML(info.threadId ?? "（尚未启动）")}</code>`,
+    `<b>工作区：</b><code>${escapeHTML(info.workspace)}</code>`,
+    `<b>启动配置：</b><code>${escapeHTML(info.launchProfileLabel)}</code>`,
+    `<b>启动行为：</b><code>${escapeHTML(info.launchProfileBehavior)}</code>${info.unsafeLaunch ? " ⚠️" : ""}`,
     info.nextLaunchProfileId
-      ? `<b>Next launch profile:</b> <code>${escapeHTML(info.nextLaunchProfileLabel ?? "")}</code> <i>(${escapeHTML(info.nextLaunchProfileBehavior ?? "")})</i>${info.nextUnsafeLaunch ? " ⚠️" : ""}`
+      ? `<b>下次启动配置：</b><code>${escapeHTML(info.nextLaunchProfileLabel ?? "")}</code> <i>（${escapeHTML(info.nextLaunchProfileBehavior ?? "")}）</i>${info.nextUnsafeLaunch ? " ⚠️" : ""}`
       : undefined,
-    info.model ? `<b>Model:</b> <code>${escapeHTML(info.model)}</code>` : undefined,
-    info.reasoningEffort ? `<b>Reasoning effort:</b> <code>${escapeHTML(info.reasoningEffort)}</code>` : undefined,
-    info.sessionTokens ? `<b>Session tokens:</b> <code>${escapeHTML(formatSessionTokensValue(info.sessionTokens))}</code>` : undefined,
+    info.model ? `<b>模型：</b><code>${escapeHTML(info.model)}</code>` : undefined,
+    info.reasoningEffort ? `<b>推理强度：</b><code>${escapeHTML(info.reasoningEffort)}</code>` : undefined,
+    info.sessionTokens ? `<b>会话 Token：</b><code>${escapeHTML(formatSessionTokensValue(info.sessionTokens))}</code>` : undefined,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
 }
 
 function renderLaunchSummaryPlain(info: CodexSessionInfo): string {
-  return `Launch: ${info.launchProfileLabel} (${info.launchProfileBehavior})${info.unsafeLaunch ? " [unsafe]" : ""}`;
+  return `启动配置：${info.launchProfileLabel}（${info.launchProfileBehavior}）${info.unsafeLaunch ? " [不安全]" : ""}`;
 }
 
 function renderLaunchSummaryHTML(info: CodexSessionInfo): string {
   const suffix = info.unsafeLaunch ? " ⚠️" : "";
-  return `<b>Launch:</b> <code>${escapeHTML(info.launchProfileLabel)}</code> <i>(${escapeHTML(info.launchProfileBehavior)})</i>${suffix}`;
+  return `<b>启动配置：</b><code>${escapeHTML(info.launchProfileLabel)}</code> <i>（${escapeHTML(info.launchProfileBehavior)}）</i>${suffix}`;
 }
 
 function renderToolStartMessage(toolName: string): RenderedText {
   return {
-    text: `<b>🔧 Running:</b> <code>${escapeHTML(toolName)}</code>`,
-    fallbackText: `🔧 Running: ${toolName}`,
+    text: `<b>🔧 正在运行：</b><code>${escapeHTML(toolName)}</code>`,
+    fallbackText: `🔧 正在运行：${toolName}`,
     parseMode: "HTML",
   };
 }
@@ -2210,7 +2812,11 @@ function renderToolEndMessage(toolName: string, partialResult: string, isError: 
   const plainLines = [`${icon} ${toolName}`];
 
   if (preview) {
-    htmlLines.push(`<pre>${escapeHTML(preview)}</pre>`);
+    if (isExpandableTool(toolName)) {
+      htmlLines.push(`<blockquote expandable>${escapeHTML(preview)}</blockquote>`);
+    } else {
+      htmlLines.push(`<pre>${escapeHTML(preview)}</pre>`);
+    }
     plainLines.push(preview);
   }
 
@@ -2219,6 +2825,15 @@ function renderToolEndMessage(toolName: string, partialResult: string, isError: 
     fallbackText: plainLines.join("\n"),
     parseMode: "HTML",
   };
+}
+
+function isExpandableTool(toolName: string): boolean {
+  return (
+    !toolName.startsWith("🔍 ") &&
+    toolName !== "file_change" &&
+    toolName !== "⚠️ error" &&
+    !toolName.startsWith("mcp:")
+  );
 }
 
 export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
@@ -2239,7 +2854,7 @@ export function formatToolSummaryLine(toolCounts: Map<string, number>): string {
   const tools = entries
     .map(([name, count]) => formatSummaryEntry(name, count))
     .join(", ");
-  return `Tools used: ${tools}`;
+  return `已使用工具：${tools}`;
 }
 
 function renderTodoList(items: Array<{ text: string; completed: boolean }>): string {
@@ -2247,11 +2862,11 @@ function renderTodoList(items: Array<{ text: string; completed: boolean }>): str
     const icon = item.completed ? "✅" : "⬜";
     return `${icon} ${escapeHTML(item.text)}`;
   });
-  return `📋 <b>Plan</b>\n${lines.join("\n")}`;
+  return `📋 <b>计划</b>\n${lines.join("\n")}`;
 }
 
 export function formatTurnUsageLine(usage: { inputTokens: number; cachedInputTokens: number; outputTokens: number }): string {
-  return `🪙 in: ${usage.inputTokens} · cached: ${usage.cachedInputTokens} · out: ${usage.outputTokens}`;
+  return `🪙 输入：${usage.inputTokens} · 缓存：${usage.cachedInputTokens} · 输出：${usage.outputTokens}`;
 }
 
 export function summarizeToolName(toolName: string): string {
@@ -2290,11 +2905,11 @@ function formatSummaryEntry(name: string, count: number): string {
 const SUBAGENT_TOOL_NAMES = new Set(["spawn_agent", "send_input", "wait_agent", "close_agent", "resume_agent"]);
 
 function formatSessionTokensValue(tokens: { input: number; cached: number; output: number }): string {
-  return `in: ${tokens.input} · cached: ${tokens.cached} · out: ${tokens.output}`;
+  return `输入：${tokens.input} · 缓存：${tokens.cached} · 输出：${tokens.output}`;
 }
 
 function formatSessionTokensPlain(tokens: { input: number; cached: number; output: number }): string {
-  return `Session tokens: ${formatSessionTokensValue(tokens)}`;
+  return `会话 Token：${formatSessionTokensValue(tokens)}`;
 }
 
 async function safeReply(ctx: Context, text: string, options: TextOptions = {}): Promise<void> {
@@ -2383,19 +2998,19 @@ async function downloadTelegramFile(
 ): Promise<string> {
   const file = await api.getFile(fileId);
   if (!file.file_path) {
-    throw new Error("Telegram did not return a file path");
+    throw new Error("Telegram 未返回文件路径");
   }
 
   if (file.file_size && file.file_size > maxBytes) {
     throw new Error(
-      `Telegram file too large (${Math.round(file.file_size / 1024 / 1024)} MB, max ${Math.round(maxBytes / 1024 / 1024)} MB)`,
+      `Telegram 文件过大（${Math.round(file.file_size / 1024 / 1024)} MB，最大 ${Math.round(maxBytes / 1024 / 1024)} MB）`,
     );
   }
 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`Failed to download Telegram file: ${response.status}`);
+    throw new Error(`下载 Telegram 文件失败：${response.status}`);
   }
 
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -2486,7 +3101,7 @@ function formatMarkdownMessage(markdown: string): RenderedText {
       parseMode: "HTML",
     };
   } catch (error) {
-    console.error("Failed to format Telegram HTML, falling back to plain text", error);
+    console.error("格式化 Telegram HTML 失败，改用纯文本", error);
     return {
       text: markdown,
       fallbackText: markdown,
@@ -2511,14 +3126,6 @@ function findPreferredSplitIndex(text: string, maxLength: number): number {
   }
 
   return Math.max(1, maxLength);
-}
-
-function buildStreamingPreview(text: string): string {
-  if (text.length <= STREAMING_PREVIEW_LIMIT) {
-    return text;
-  }
-
-  return `${text.slice(0, STREAMING_PREVIEW_LIMIT)}\n\n… streaming (preview truncated)`;
 }
 
 function appendWithCap(base: string, addition: string, cap: number): string {
@@ -2553,26 +3160,26 @@ function formatRelativeTime(date: Date): string {
   const deltaSeconds = Math.max(0, Math.floor(deltaMs / 1000));
 
   if (deltaSeconds < 60) {
-    return "just now";
+    return "刚刚";
   }
 
   const deltaMinutes = Math.floor(deltaSeconds / 60);
   if (deltaMinutes < 60) {
-    return `${deltaMinutes}m ago`;
+    return `${deltaMinutes} 分钟前`;
   }
 
   const deltaHours = Math.floor(deltaMinutes / 60);
   if (deltaHours < 48) {
-    return `${deltaHours}h ago`;
+    return `${deltaHours} 小时前`;
   }
 
   const deltaDays = Math.floor(deltaHours / 24);
   if (deltaDays < 14) {
-    return `${deltaDays}d ago`;
+    return `${deltaDays} 天前`;
   }
 
   const deltaWeeks = Math.floor(deltaDays / 7);
-  return `${deltaWeeks}w ago`;
+  return `${deltaWeeks} 周前`;
 }
 
 function isMessageNotModifiedError(error: unknown): boolean {
@@ -2591,9 +3198,9 @@ function isTelegramParseError(error: unknown): boolean {
   );
 }
 
-function renderPromptFailure(accumulatedText: string, error: unknown): string {
+function renderPromptFailure(error: unknown): string {
   const message = friendlyErrorText(error);
-  return accumulatedText.trim() ? `${accumulatedText.trim()}\n\n⚠️ ${message}` : `⚠️ ${message}`;
+  return `⚠️ ${message}`;
 }
 
 function formatError(error: unknown): string {

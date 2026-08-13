@@ -30,6 +30,7 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - The Codex CLI installed and authenticated on the host:
   - API key auth: set `CODEX_API_KEY`
   - ChatGPT login: `codex login` on the machine, or use `/login` from Telegram
+  - Custom provider: configure `model_provider` and `model_providers` in `~/.codex/config.toml`; TeleCodex inherits this configuration automatically
 - *(Optional)* `ffmpeg` — required for local voice transcription via parakeet-coreml
 - *(Optional)* `OPENAI_API_KEY` — enables OpenAI Whisper as a voice transcription fallback
 
@@ -51,8 +52,8 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
    |---|---|---|
    | `TELEGRAM_BOT_TOKEN` | ✅ | Bot token from @BotFather |
    | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Comma-separated Telegram user IDs |
-   | `CODEX_API_KEY` | — | API key for Codex (alternative to ChatGPT login) |
-   | `CODEX_MODEL` | — | Default model, e.g. `gpt-5.4`, `o3` |
+   | `CODEX_API_KEY` | — | Overrides the Codex CLI configuration with an API key; leave unset to inherit `~/.codex/config.toml` |
+   | `CODEX_MODEL` | — | Overrides the model from `~/.codex/config.toml` |
    | `CODEX_SANDBOX_MODE` | — | `read-only`, `workspace-write` *(default)*, `danger-full-access` |
    | `CODEX_APPROVAL_POLICY` | — | `never` *(default)*, `on-request`, `on-failure`, `untrusted` |
    | `CODEX_LAUNCH_PROFILES_JSON` | — | Optional JSON array of named launch profiles for `/launch_profiles` |

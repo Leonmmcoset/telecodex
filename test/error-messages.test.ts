@@ -6,23 +6,23 @@ describe("error-messages", () => {
   describe("translateError", () => {
     it("translates connection refused", () => {
       const result = translateError(new Error("connect ECONNREFUSED 127.0.0.1:443"));
-      expect(result.userMessage).toContain("network connection");
+      expect(result.userMessage).toContain("网络连接");
       expect(result.logMessage).toContain("ECONNREFUSED");
     });
 
     it("translates fetch failed", () => {
       const result = translateError(new Error("fetch failed"));
-      expect(result.userMessage).toContain("network connection");
+      expect(result.userMessage).toContain("网络连接");
     });
 
     it("translates rate limit (429)", () => {
       const result = translateError(new Error("Request failed with status 429"));
-      expect(result.userMessage).toContain("Rate limited");
+      expect(result.userMessage).toContain("请求过于频繁");
     });
 
     it("translates rate limit (text)", () => {
       const result = translateError(new Error("Rate limit exceeded"));
-      expect(result.userMessage).toContain("Rate limited");
+      expect(result.userMessage).toContain("请求过于频繁");
     });
 
     it("translates 401 unauthorized", () => {
@@ -37,7 +37,7 @@ describe("error-messages", () => {
 
     it("translates 403 forbidden", () => {
       const result = translateError(new Error("403 Forbidden"));
-      expect(result.userMessage).toContain("Access denied");
+      expect(result.userMessage).toContain("访问被拒绝");
     });
 
     it("translates model not found", () => {
@@ -47,27 +47,27 @@ describe("error-messages", () => {
 
     it("translates timeout", () => {
       const result = translateError(new Error("Request timeout ETIMEDOUT"));
-      expect(result.userMessage).toContain("timed out");
+      expect(result.userMessage).toContain("请求超时");
     });
 
     it("translates abort", () => {
       const result = translateError(new Error("The operation was aborted"));
-      expect(result.userMessage).toBe("⏹ Aborted");
+      expect(result.userMessage).toBe("⏹ 已取消");
     });
 
     it("does not match abort in unrelated error messages", () => {
       const result = translateError(new Error("500 Internal Server Error (connection aborted)"));
-      expect(result.userMessage).toContain("server error");
+      expect(result.userMessage).toContain("服务器错误");
     });
 
     it("translates 500 server error", () => {
       const result = translateError(new Error("500 Internal Server Error"));
-      expect(result.userMessage).toContain("server error");
+      expect(result.userMessage).toContain("服务器错误");
     });
 
     it("translates 502/503/504 gateway errors", () => {
-      expect(translateError(new Error("502 Bad Gateway")).userMessage).toContain("unavailable");
-      expect(translateError(new Error("503 Service Unavailable")).userMessage).toContain("unavailable");
+      expect(translateError(new Error("502 Bad Gateway")).userMessage).toContain("暂时不可用");
+      expect(translateError(new Error("503 Service Unavailable")).userMessage).toContain("暂时不可用");
     });
 
     it("translates context length exceeded", () => {
@@ -94,14 +94,14 @@ describe("error-messages", () => {
       const outer = new Error("Request failed");
       (outer as Error & { cause?: Error }).cause = inner;
       const result = translateError(outer);
-      expect(result.userMessage).toContain("network connection");
+      expect(result.userMessage).toContain("网络连接");
     });
   });
 
   describe("friendlyErrorText", () => {
     it("returns just the user message string", () => {
       const text = friendlyErrorText(new Error("429 too many requests"));
-      expect(text).toContain("Rate limited");
+      expect(text).toContain("请求过于频繁");
     });
   });
 });

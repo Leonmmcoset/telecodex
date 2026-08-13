@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@grammyjs/auto-retry": "^2.0.2",
+    "@grammyjs/runner": "^2.0.3",
     "@openai/codex-sdk": "^0.116.0",
     "grammy": "^1.41.1"
   },

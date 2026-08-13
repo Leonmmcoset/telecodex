@@ -46,7 +46,7 @@ export async function stageFile(
   if (buffer.byteLength > options.maxFileSize) {
     const sizeMB = Math.round(buffer.byteLength / 1024 / 1024);
     const maxMB = Math.round(options.maxFileSize / 1024 / 1024);
-    throw new Error(`File too large (${sizeMB} MB, max ${maxMB} MB)`);
+    throw new Error(`文件过大（${sizeMB} MB，最大 ${maxMB} MB）`);
   }
 
   const safeName = sanitizeFilename(originalName);
@@ -70,15 +70,15 @@ export function buildFileInstructions(files: StagedFile[], outDir: string): stri
     return "";
   }
 
-  const lines = ["The following files were uploaded by the user and staged on disk:", ""];
+  const lines = ["用户上传的文件已暂存到磁盘：", ""];
 
   for (const file of files) {
     lines.push(`- ${file.safeName} (${file.mimeType}, ${formatBytes(file.sizeBytes)}) → ${file.localPath}`);
   }
 
   lines.push("");
-  lines.push(`Write any output files to: ${outDir}`);
-  lines.push("The user will receive files from that directory after this turn completes.");
+  lines.push(`请将输出文件写入：${outDir}`);
+  lines.push("本轮完成后，用户会收到该目录中的文件。");
 
   return lines.join("\n");
 }

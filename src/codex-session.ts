@@ -23,9 +23,16 @@ import {
   formatLaunchProfileBehavior,
   type CodexLaunchProfile,
 } from "./codex-launch.js";
+import {
+  CodexAppServerClient,
+  type AppServerApprovalRequest,
+  type AppServerInput,
+  type AppServerPlanUpdate,
+  type AppServerUserInputRequest,
+} from "./codex-app-server.js";
 
 export interface CodexSessionCallbacks {
-  onTextDelta: (delta: string) => void;
+  onAgentMessage: (text: string) => void;
   onToolStart: (toolName: string, toolCallId: string) => void;
   onToolUpdate: (toolCallId: string, partialResult: string) => void;
   onToolEnd: (toolCallId: string, isError: boolean) => void;
@@ -36,6 +43,11 @@ export interface CodexSessionCallbacks {
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+  onPlanUpdate?: (update: AppServerPlanUpdate) => void;
+  onUserInputRequest?: (
+    request: AppServerUserInputRequest,
+  ) => Promise<{ answers: Record<string, { answers: string[] }> }>;
+  onApprovalRequest?: (request: AppServerApprovalRequest) => Promise<unknown>;
 }
 
 export interface CodexSessionInfo {
@@ -71,6 +83,8 @@ export interface CreateOptions {
 
 export type CodexPromptInput = string | { text?: string; imagePaths?: string[]; stagedFileInstructions?: string };
 
+const CHINESE_RESPONSE_INSTRUCTION = "请使用简体中文回答，保留代码、命令、路径、环境变量和模型名称原样。";
+
 export class CodexSessionService {
   private codex: Codex | null = null;
   private thread: Thread | null = null;
@@ -82,6 +96,7 @@ export class CodexSessionService {
   private currentLaunchProfile: CodexLaunchProfile;
   private activeThreadLaunchProfile: CodexLaunchProfile | null = null;
   private sessionTokens = { input: 0, cached: 0, output: 0 };
+  private appServer: CodexAppServerClient | null = null;
 
   private constructor(private readonly config: TeleCodexConfig) {
     this.currentWorkspace = config.workspace;
@@ -148,7 +163,7 @@ export class CodexSessionService {
   }
 
   isProcessing(): boolean {
-    return this.abortController !== null;
+    return this.abortController !== null || this.appServer?.isTurnActive() === true;
   }
 
   hasActiveThread(): boolean {
@@ -170,8 +185,6 @@ export class CodexSessionService {
 
     const controller = new AbortController();
     this.abortController = controller;
-    let lastAgentText = "";
-
     // Track cumulative aggregated_output per command item to compute deltas.
     const lastCommandOutput = new Map<string, string>();
 
@@ -185,15 +198,7 @@ export class CodexSessionService {
           case "item.started":
           case "item.updated": {
             const item = event.item;
-            if (item.type === "agent_message") {
-              const delta = computeTextDelta(lastAgentText, item.text);
-              if (delta) {
-                lastAgentText = item.text;
-                callbacks.onTextDelta(delta);
-              } else {
-                lastAgentText = item.text;
-              }
-            } else if (item.type === "command_execution") {
+            if (item.type === "command_execution") {
               if (event.type === "item.started") {
                 // Record baseline so the first item.updated delta is computed correctly.
                 lastCommandOutput.set(item.id, item.aggregated_output);
@@ -221,11 +226,10 @@ export class CodexSessionService {
           case "item.completed": {
             const item = event.item;
             if (item.type === "agent_message") {
-              const delta = computeTextDelta(lastAgentText, item.text);
-              if (delta) {
-                callbacks.onTextDelta(delta);
+              const text = item.text.trim();
+              if (text) {
+                callbacks.onAgentMessage(text);
               }
-              lastAgentText = item.text;
             } else if (item.type === "command_execution") {
               // Pass any output that arrived only in the completion event (e.g. fast
               // commands that never fired item.updated).
@@ -291,10 +295,50 @@ export class CodexSessionService {
 
   async abort(): Promise<void> {
     this.abortController?.abort();
+    await this.appServer?.interrupt();
+  }
+
+  async promptPlan(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    const client = await this.ensureAppServerThread();
+    await client.runPlan(
+      this.buildAppServerInput(input),
+      callbacks,
+      this.currentModel ?? this.config.codexModel,
+      this.currentReasoningEffort,
+    );
+  }
+
+  async continuePlan(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    const client = await this.ensureAppServerThread();
+    const appInput = this.buildAppServerInput(input);
+    if (client.isTurnActive()) {
+      await client.steer(appInput);
+      return;
+    }
+
+    await client.runPlan(
+      appInput,
+      callbacks,
+      this.currentModel ?? this.config.codexModel,
+      this.currentReasoningEffort,
+    );
+  }
+
+  async executePlan(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    const client = await this.ensureAppServerThread();
+    await client.runDefault(
+      this.buildAppServerInput(input),
+      callbacks,
+      this.currentModel ?? this.config.codexModel,
+      this.currentReasoningEffort,
+    );
   }
 
   async newThread(workspace?: string, model?: string): Promise<CodexSessionInfo> {
     this.ensureIdle("start a new thread");
+
+    this.appServer?.dispose();
+    this.appServer = null;
 
     const effectiveWorkspace = workspace ?? this.currentWorkspace;
     const effectiveModel = model ?? this.currentModel;
@@ -311,6 +355,9 @@ export class CodexSessionService {
   async resumeThread(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("resume a thread");
 
+    this.appServer?.dispose();
+    this.appServer = null;
+
     this.thread = this.getCodex().resumeThread(
       threadId,
       this.buildThreadOptions(this.currentWorkspace, this.currentModel),
@@ -322,6 +369,9 @@ export class CodexSessionService {
 
   async switchSession(threadId: string): Promise<CodexSessionInfo> {
     this.ensureIdle("switch session");
+
+    this.appServer?.dispose();
+    this.appServer = null;
 
     const record = getThread(threadId);
     const workspace = record?.cwd ?? this.currentWorkspace;
@@ -371,6 +421,8 @@ export class CodexSessionService {
   handback(): { threadId: string | null; workspace: string } {
     const info = { threadId: this.currentThreadId, workspace: this.currentWorkspace };
     this.abortController?.abort();
+    this.appServer?.dispose();
+    this.appServer = null;
     this.abortController = null;
     this.thread = null;
     this.currentThreadId = null;
@@ -380,6 +432,8 @@ export class CodexSessionService {
 
   dispose(): void {
     this.abortController?.abort();
+    this.appServer?.dispose();
+    this.appServer = null;
     this.abortController = null;
     this.thread = null;
     this.currentThreadId = null;
@@ -388,11 +442,11 @@ export class CodexSessionService {
 
   private buildSdkInput(input: CodexPromptInput): Input {
     if (typeof input === "string") {
-      return input;
+      return [CHINESE_RESPONSE_INSTRUCTION, input].filter(Boolean).join("\n\n");
     }
 
     const parts: UserInput[] = [];
-    const textParts: string[] = [];
+    const textParts: string[] = [CHINESE_RESPONSE_INSTRUCTION];
 
     if (input.stagedFileInstructions) {
       textParts.push(input.stagedFileInstructions);
@@ -415,6 +469,56 @@ export class CodexSessionService {
       return parts[0].text;
     }
     return parts;
+  }
+
+  private buildAppServerInput(input: CodexPromptInput): AppServerInput[] {
+    const parts: AppServerInput[] = [];
+    const textParts: string[] = [CHINESE_RESPONSE_INSTRUCTION];
+
+    if (typeof input === "string") {
+      textParts.push(input);
+    } else {
+      if (input.stagedFileInstructions) {
+        textParts.push(input.stagedFileInstructions);
+      }
+      if (input.text) {
+        textParts.push(input.text);
+      }
+      for (const imagePath of input.imagePaths ?? []) {
+        parts.push({ type: "localImage", path: imagePath });
+      }
+    }
+
+    if (textParts.length > 0) {
+      parts.unshift({ type: "text", text: textParts.join("\n\n"), text_elements: [] });
+    }
+    return parts;
+  }
+
+  private async ensureAppServerThread(): Promise<CodexAppServerClient> {
+    if (!this.appServer) {
+      this.appServer = new CodexAppServerClient();
+    }
+
+    const existingThreadId = this.thread?.id ?? this.currentThreadId;
+    const options = {
+      workspace: this.currentWorkspace,
+      model: this.currentModel ?? this.config.codexModel,
+      sandboxMode: this.currentLaunchProfile.sandboxMode,
+      approvalPolicy: this.currentLaunchProfile.approvalPolicy,
+    };
+
+    const thread = existingThreadId
+      ? await this.appServer.resumeThread({ threadId: existingThreadId, ...options })
+      : await this.appServer.startThread(options);
+
+    this.currentThreadId = thread.id;
+    this.currentModel = thread.model || this.currentModel;
+    this.activeThreadLaunchProfile = this.currentLaunchProfile;
+    if (!this.thread || this.thread.id !== thread.id) {
+      this.thread = this.getCodex().resumeThread(thread.id, this.buildThreadOptions(this.currentWorkspace, this.currentModel));
+    }
+    return this.appServer;
   }
 
   private buildThreadOptions(workspace: string, model?: string): {

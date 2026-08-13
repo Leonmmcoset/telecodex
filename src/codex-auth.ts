@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 
 export interface AuthStatus {
   authenticated: boolean;
-  method: "api-key" | "cli" | "none";
+  method: "api-key" | "cli" | "config" | "none";
   detail: string;
 }
 
@@ -22,8 +24,9 @@ let cachedAuthStatus: { status: AuthStatus; expiresAt: number } | undefined;
  *
  * Priority:
  * 1. If CODEX_API_KEY is set in the environment, report authenticated via API key.
- * 2. Otherwise, shell out to `codex login status` to check CLI auth.
- * 3. If the CLI command fails or is unavailable, report unauthenticated.
+ * 2. Otherwise, detect a configured custom provider in ~/.codex/config.toml.
+ * 3. Otherwise, shell out to `codex login status` to check CLI auth.
+ * 4. Otherwise, report unauthenticated.
  *
  * Results are cached for 30 seconds to avoid per-message CLI invocations.
  */
@@ -32,12 +35,23 @@ export async function checkAuthStatus(apiKey?: string): Promise<AuthStatus> {
     return {
       authenticated: true,
       method: "api-key",
-      detail: "Authenticated via CODEX_API_KEY",
+      detail: "已通过 CODEX_API_KEY 认证",
     };
   }
 
   if (cachedAuthStatus && Date.now() < cachedAuthStatus.expiresAt) {
     return cachedAuthStatus.status;
+  }
+
+  const customProvider = getConfiguredCustomProvider();
+  if (customProvider) {
+    const status: AuthStatus = {
+      authenticated: true,
+      method: "config",
+      detail: `已在 ~/.codex/config.toml 中配置自定义服务商“${customProvider}”。`,
+    };
+    cachedAuthStatus = { status, expiresAt: Date.now() + AUTH_CACHE_TTL_MS };
+    return status;
   }
 
   try {
@@ -46,7 +60,7 @@ export async function checkAuthStatus(apiKey?: string): Promise<AuthStatus> {
     const status: AuthStatus = {
       authenticated: true,
       method: "cli",
-      detail: output || "Authenticated via Codex CLI",
+      detail: output || "已通过 Codex CLI 认证",
     };
     cachedAuthStatus = { status, expiresAt: Date.now() + AUTH_CACHE_TTL_MS };
     return status;
@@ -55,6 +69,37 @@ export async function checkAuthStatus(apiKey?: string): Promise<AuthStatus> {
     cachedAuthStatus = { status, expiresAt: Date.now() + AUTH_CACHE_TTL_MS };
     return status;
   }
+}
+
+/**
+ * Detects the active custom provider without inspecting any credential values.
+ * Codex CLI login state does not apply to providers that authenticate in config.toml.
+ */
+function getConfiguredCustomProvider(): string | undefined {
+  const codexHome = process.env.CODEX_HOME?.trim() || path.join(process.env.USERPROFILE || process.env.HOME || "", ".codex");
+  const configPath = path.join(codexHome, "config.toml");
+  if (!existsSync(configPath)) {
+    return undefined;
+  }
+
+  try {
+    const contents = readFileSync(configPath, "utf8");
+    const providerMatch = contents.match(/^\s*model_provider\s*=\s*["']([^"']+)["']\s*$/m);
+    if (!providerMatch?.[1]) {
+      return undefined;
+    }
+
+    const providerId = providerMatch[1];
+    const escapedProviderId = escapeRegExp(providerId);
+    const providerSection = new RegExp(`^\\s*\\[model_providers\\.${escapedProviderId}\\]\\s*$`, "m");
+    return providerSection.test(contents) ? providerId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -76,13 +121,13 @@ export async function startLogin(): Promise<LoginResult> {
     const output = stdout.trim();
     return {
       success: true,
-      message: output || "Login initiated. Check your terminal or browser for the next step.",
+      message: output || "已开始登录。请在终端或浏览器中完成下一步。",
     };
   } catch (error) {
     const detail = extractErrorMessage(error);
     return {
       success: false,
-      message: detail || "Login command failed. Try running 'codex auth login' on the host.",
+      message: detail || "登录命令失败。请尝试在主机上运行“codex auth login”。",
     };
   }
 }
@@ -98,13 +143,13 @@ export async function startLogout(): Promise<LoginResult> {
     const output = stdout.trim();
     return {
       success: true,
-      message: output || "Logged out successfully.",
+      message: output || "已成功退出登录。",
     };
   } catch (error) {
     const detail = extractErrorMessage(error);
     return {
       success: false,
-      message: detail || "Logout command failed. Try running 'codex auth logout' on the host.",
+      message: detail || "退出登录命令失败。请尝试在主机上运行“codex auth logout”。",
     };
   }
 }
@@ -143,11 +188,11 @@ function parseCommandError(error: unknown): AuthStatus {
     return {
       authenticated: false,
       method: "none",
-      detail: "Codex CLI not found. Install it or set CODEX_API_KEY.",
+      detail: "未找到 Codex CLI。请安装它，或设置 CODEX_API_KEY。",
     };
   }
 
-  const detail = extractErrorMessage(error) || "Not authenticated";
+  const detail = extractErrorMessage(error) || "未认证";
   return {
     authenticated: false,
     method: "none",

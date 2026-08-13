@@ -174,6 +174,38 @@ describe("SessionRegistry", () => {
     expect(mockSessionState.create).toHaveBeenCalledTimes(1);
   });
 
+  it("shares an in-flight session creation for concurrent updates", async () => {
+    const registry = new SessionRegistry(createConfig());
+    let resolveCreation!: (session: unknown) => void;
+    const creation = new Promise<unknown>((resolve) => {
+      resolveCreation = resolve;
+    });
+    mockSessionState.create.mockImplementationOnce(() => creation);
+
+    const firstPromise = registry.getOrCreate("123");
+    const secondPromise = registry.getOrCreate("123");
+
+    expect(mockSessionState.create).toHaveBeenCalledTimes(1);
+
+    const session = createMockSession({
+      threadId: null,
+      workspace: "/workspace/base",
+      model: "o3",
+      launchProfileId: "default",
+      launchProfileLabel: "Default",
+      launchProfileBehavior: "workspace-write / never",
+      sandboxMode: "workspace-write",
+      approvalPolicy: "never",
+      unsafeLaunch: false,
+    });
+    resolveCreation(session);
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    expect(first).toBe(session);
+    expect(second).toBe(session);
+    expect(registry.get("123")).toBe(session);
+  });
+
   it("returns different session instances for different context keys", async () => {
     const registry = new SessionRegistry(createConfig());
 

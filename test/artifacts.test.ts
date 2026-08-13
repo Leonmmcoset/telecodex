@@ -83,7 +83,7 @@ describe("formatArtifactSummary", () => {
 
   it("formats single artifact", () => {
     const artifacts = [{ name: "out.txt", localPath: "/tmp/out.txt", sizeBytes: 100 }];
-    expect(formatArtifactSummary(artifacts, 0)).toContain("1 artifact generated");
+    expect(formatArtifactSummary(artifacts, 0)).toContain("已生成 1 个文件");
   });
 
   it("formats multiple artifacts", () => {
@@ -91,10 +91,10 @@ describe("formatArtifactSummary", () => {
       { name: "a.txt", localPath: "/tmp/a.txt", sizeBytes: 100 },
       { name: "b.txt", localPath: "/tmp/b.txt", sizeBytes: 200 },
     ];
-    expect(formatArtifactSummary(artifacts, 0)).toContain("2 artifacts generated");
+    expect(formatArtifactSummary(artifacts, 0)).toContain("已生成 2 个文件");
   });
 
   it("reports skipped files", () => {
-    expect(formatArtifactSummary([], 3)).toContain("3 files too large to send");
+    expect(formatArtifactSummary([], 3)).toContain("3 个文件过大，无法发送");
   });
 });

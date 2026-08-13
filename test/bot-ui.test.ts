@@ -11,20 +11,20 @@ describe("bot-ui", () => {
   describe("renderHelpMessage", () => {
     it("contains all command groups", () => {
       const { html, plain } = renderHelpMessage();
-      expect(html).toContain("Session");
-      expect(html).toContain("Model");
-      expect(html).toContain("Auth");
-      expect(html).toContain("Utility");
+      expect(html).toContain("会话");
+      expect(html).toContain("模型");
+      expect(html).toContain("认证");
+      expect(html).toContain("工具");
       expect(plain).toContain("/new");
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
       expect(plain).toContain("/launch_profiles");
     });
 
-    it("lists all 16 commands", () => {
+    it("lists all 17 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(16);
+      expect(commandMatches.length).toBe(17);
     });
 
     it("returns valid HTML with bold tags", () => {
@@ -37,7 +37,7 @@ describe("bot-ui", () => {
   describe("renderWelcomeFirstTime", () => {
     it("shows welcome without auth warning", () => {
       const { html, plain } = renderWelcomeFirstTime();
-      expect(html).toContain("TeleCodex is ready");
+      expect(html).toContain("TeleCodex 已就绪");
       expect(plain).toContain("/help");
       expect(html).not.toContain("⚠️");
     });
@@ -63,7 +63,7 @@ describe("bot-ui", () => {
 
     it("shows topic label for topic sessions", () => {
       const { html } = renderWelcomeReturning("", "", true);
-      expect(html).toContain("topic session");
+      expect(html).toContain("话题会话");
     });
 
     it("includes auth warning when provided", () => {
@@ -135,7 +135,7 @@ describe("bot-ui", () => {
         relativeTime: "5m ago",
         isActive: false,
       });
-      expect(label).toContain("(untitled)");
+      expect(label).toContain("（未命名）");
     });
 
     it("truncates long model names", () => {

@@ -18,6 +18,7 @@ export interface ContextMetadata {
 
 export class SessionRegistry {
   private readonly sessions = new Map<TelegramContextKey, CodexSessionService>();
+  private readonly sessionCreations = new Map<TelegramContextKey, Promise<CodexSessionService>>();
   private readonly metadata = new Map<TelegramContextKey, ContextMetadata>();
   private readonly persistPath: string;
   private onRemoveCallback?: (contextKey: TelegramContextKey) => void;
@@ -36,19 +37,33 @@ export class SessionRegistry {
       return session;
     }
 
+    const pendingCreation = this.sessionCreations.get(contextKey);
+    if (pendingCreation) {
+      return pendingCreation;
+    }
+
     const meta = this.metadata.get(contextKey);
     const launchProfileId = resolveLaunchProfileId(this.config, meta);
-    session = await CodexSessionService.create(this.config, {
+    const creation = CodexSessionService.create(this.config, {
       workspace: meta?.workspace,
       model: meta?.model,
       reasoningEffort: meta?.reasoningEffort,
       launchProfileId,
       deferThreadStart: options?.deferThreadStart && !meta?.threadId,
       resumeThreadId: meta?.threadId ?? undefined,
+    }).then((createdSession) => {
+      if (this.sessionCreations.get(contextKey) === creation) {
+        this.sessions.set(contextKey, createdSession);
+      }
+      return createdSession;
+    }).finally(() => {
+      if (this.sessionCreations.get(contextKey) === creation) {
+        this.sessionCreations.delete(contextKey);
+      }
     });
 
-    this.sessions.set(contextKey, session);
-    return session;
+    this.sessionCreations.set(contextKey, creation);
+    return creation;
   }
 
   get(contextKey: TelegramContextKey): CodexSessionService | undefined {
@@ -86,6 +101,7 @@ export class SessionRegistry {
   }
 
   remove(contextKey: TelegramContextKey): void {
+    this.sessionCreations.delete(contextKey);
     const session = this.sessions.get(contextKey);
     session?.dispose();
     this.sessions.delete(contextKey);
@@ -95,6 +111,7 @@ export class SessionRegistry {
   }
 
   disposeAll(): void {
+    this.sessionCreations.clear();
     for (const session of this.sessions.values()) {
       session.dispose();
     }

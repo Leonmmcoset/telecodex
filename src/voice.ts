@@ -18,15 +18,15 @@ interface ParakeetEngine {
 }
 
 const PARAKEET_SPECIFIER = "parakeet-coreml";
-const FFMPEG_INSTALL_MESSAGE = "ffmpeg not found. Install it with: brew install ffmpeg";
-const NO_BACKEND_ERROR = `Voice messages require a transcription backend.
+const FFMPEG_INSTALL_MESSAGE = "未找到 ffmpeg。请使用以下命令安装：brew install ffmpeg";
+const NO_BACKEND_ERROR = `语音消息需要语音转写后端。
 
-Option 1: Install Parakeet for local transcription (free, private, ~1.5GB download):
+方案 1：安装 Parakeet 进行本地转写（免费、私密，约需下载 1.5GB）：
   npm install parakeet-coreml
-Also requires ffmpeg: brew install ffmpeg
+还需要安装 ffmpeg：brew install ffmpeg
 
-Option 2: Set OPENAI_API_KEY for cloud transcription (~$0.006/min):
-  Add OPENAI_API_KEY=sk-... to your .env file`;
+方案 2：设置 OPENAI_API_KEY 使用云端转写（约 $0.006/分钟）：
+  在 .env 文件中添加 OPENAI_API_KEY=sk-...`;
 
 const _require = createRequire(import.meta.url);
 let _importModule: (specifier: string) => Promise<unknown> = async (specifier) => _require(specifier);
@@ -92,17 +92,17 @@ async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): P
       ((mod?.default as Record<string, unknown> | undefined)?.ParakeetAsrEngine as (new () => unknown) | undefined);
 
     if (typeof ParakeetAsrEngine !== "function") {
-      throw new Error("parakeet-coreml was loaded but does not expose a ParakeetAsrEngine class");
+      throw new Error("已加载 parakeet-coreml，但未导出 ParakeetAsrEngine 类");
     }
 
     const engine = new ParakeetAsrEngine() as Record<string, unknown>;
 
     if (typeof engine.initialize !== "function") {
-      throw new Error("parakeet-coreml was loaded but the engine does not expose initialize()");
+      throw new Error("已加载 parakeet-coreml，但引擎未提供 initialize() 方法");
     }
 
     if (typeof engine.transcribe !== "function") {
-      throw new Error("parakeet-coreml was loaded but the engine does not expose transcribe(samples)");
+      throw new Error("已加载 parakeet-coreml，但引擎未提供 transcribe(samples) 方法");
     }
 
     await (engine.initialize as () => Promise<void>)();
@@ -112,7 +112,7 @@ async function transcribeWithParakeet(filePath: string, parakeetMod: unknown): P
   const result = await _engine.transcribe(samples);
   const text = extractTranscribedText(result);
   if (text === undefined) {
-    throw new Error("parakeet-coreml returned an unsupported transcription result");
+    throw new Error("parakeet-coreml 返回了不支持的转写结果");
   }
 
   const durationMs =
@@ -157,13 +157,13 @@ async function transcribeWithOpenAI(filePath: string): Promise<TranscriptionResu
   if (!response.ok) {
     const errorText = (await response.text().catch(() => "")).trim();
     throw new Error(
-      `OpenAI transcription failed (${response.status}): ${errorText || response.statusText || "Unknown error"}`,
+      `OpenAI 转写失败（${response.status}）：${errorText || response.statusText || "未知错误"}`,
     );
   }
 
   const payload = (await response.json()) as { text?: unknown };
   if (typeof payload.text !== "string") {
-    throw new Error("OpenAI transcription response did not include a text field");
+    throw new Error("OpenAI 转写响应未包含 text 字段");
   }
 
   return {
@@ -211,14 +211,14 @@ function decodeAudioToSamples(filePath: string): Promise<Float32Array> {
       finish(() => {
         if (code !== 0) {
           const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-          const reason = stderr || (signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`);
-          reject(new Error(`ffmpeg failed to decode audio: ${reason}`));
+          const reason = stderr || (signal ? `信号 ${signal}` : `退出代码 ${code ?? "未知"}`);
+          reject(new Error(`ffmpeg 解码音频失败：${reason}`));
           return;
         }
 
         const buffer = Buffer.concat(stdoutChunks);
         if (buffer.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0) {
-          reject(new Error("ffmpeg returned invalid float32 PCM output"));
+          reject(new Error("ffmpeg 返回了无效的 float32 PCM 输出"));
           return;
         }
 

@@ -6,6 +6,14 @@ vi.mock("node:child_process", () => ({
   execFile: mockExecFile,
 }));
 
+const mockExistsSync = vi.hoisted(() => vi.fn());
+const mockReadFileSync = vi.hoisted(() => vi.fn());
+
+vi.mock("node:fs", () => ({
+  existsSync: mockExistsSync,
+  readFileSync: mockReadFileSync,
+}));
+
 import { checkAuthStatus, clearAuthCache, startLogin, startLogout } from "../src/codex-auth.js";
 
 // Helper to make mockExecFile call its callback with success
@@ -40,6 +48,9 @@ function mockExecNotFound(): void {
 describe("codex-auth", () => {
   beforeEach(() => {
     mockExecFile.mockReset();
+    mockExistsSync.mockReset();
+    mockReadFileSync.mockReset();
+    mockExistsSync.mockReturnValue(false);
     clearAuthCache();
   });
 
@@ -73,6 +84,22 @@ describe("codex-auth", () => {
       expect(status.authenticated).toBe(false);
       expect(status.method).toBe("none");
       expect(status.detail).toContain("Not logged in");
+    });
+
+    it("reports configured when a custom provider is present in Codex config", async () => {
+      mockExistsSync.mockReturnValue(true);
+      mockReadFileSync.mockReturnValue(
+        ['model_provider = "custom"', "", "[model_providers.custom]", 'base_url = "https://example.test/v1"'].join("\n"),
+      );
+
+      const status = await checkAuthStatus();
+
+      expect(status).toEqual({
+        authenticated: true,
+        method: "config",
+        detail: 'Custom provider "custom" configured in ~/.codex/config.toml.',
+      });
+      expect(mockExecFile).not.toHaveBeenCalled();
     });
 
     it("reports unauthenticated when CLI is not found", async () => {

@@ -69,10 +69,10 @@ export function formatArtifactSummary(artifacts: Artifact[], skippedCount: numbe
 
   const lines: string[] = [];
   if (artifacts.length > 0) {
-    lines.push(`📎 ${artifacts.length} artifact${artifacts.length === 1 ? "" : "s"} generated`);
+    lines.push(`📎 已生成 ${artifacts.length} 个文件`);
   }
   if (skippedCount > 0) {
-    lines.push(`⚠️ ${skippedCount} file${skippedCount === 1 ? "" : "s"} too large to send`);
+    lines.push(`⚠️ ${skippedCount} 个文件过大，无法发送`);
   }
 
   return lines.join("\n");

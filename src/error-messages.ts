@@ -11,43 +11,43 @@ export interface FriendlyError {
 const ERROR_PATTERNS: Array<{ pattern: RegExp; message: string }> = [
   {
     pattern: /ECONNREFUSED|ENOTFOUND|ENETUNREACH|fetch failed/i,
-    message: "Cannot reach the Codex API. Check your network connection.",
+    message: "无法连接到 Codex API，请检查网络连接。",
   },
   {
     pattern: /429|rate.?limit|too many requests/i,
-    message: "Rate limited by the API. Wait a moment and try again.",
+    message: "请求过于频繁，请稍后再试。",
   },
   {
     pattern: /401|unauthorized|authentication|invalid.*api.?key/i,
-    message: "Authentication failed. Use /login to re-authenticate or check your API key.",
+    message: "认证失败。请使用 /login 重新认证，或检查 API 密钥。",
   },
   {
     pattern: /403|forbidden|permission/i,
-    message: "Access denied. Check your API key permissions.",
+    message: "访问被拒绝，请检查 API 密钥权限。",
   },
   {
     pattern: /404.*model|model.*not.*found|invalid.*model|model.*does not exist/i,
-    message: "Model not available. Use /model to pick a different one.",
+    message: "模型不可用，请使用 /model 选择其他模型。",
   },
   {
     pattern: /timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i,
-    message: "Request timed out. Try a shorter prompt or use /retry.",
+    message: "请求超时。请尝试更短的提问，或使用 /retry 重试。",
   },
   {
     pattern: /500|internal.?server.?error/i,
-    message: "The API returned a server error. Try again in a moment.",
+    message: "API 返回服务器错误，请稍后重试。",
   },
   {
     pattern: /502|503|504|bad.?gateway|service.?unavailable/i,
-    message: "The API is temporarily unavailable. Try again shortly.",
+    message: "API 暂时不可用，请稍后重试。",
   },
   {
     pattern: /context.?length|token.?limit|too.?long/i,
-    message: "The conversation is too long for this model. Start a /new thread.",
+    message: "对话内容超出当前模型的上下文限制，请使用 /new 新建会话。",
   },
   {
     pattern: /^(?:AbortError|The operation was aborted)/i,
-    message: "⏹ Aborted",
+    message: "⏹ 已取消",
   },
 ];
 

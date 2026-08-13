@@ -37,7 +37,7 @@ export function createDefaultLaunchProfile(
 ): CodexLaunchProfile {
   return createLaunchProfile({
     id: DEFAULT_LAUNCH_PROFILE_ID,
-    label: "Default",
+    label: "默认",
     sandboxMode,
     approvalPolicy,
   });
@@ -51,13 +51,13 @@ export function createBuiltinLaunchProfiles(
     defaultProfile,
     createLaunchProfile({
       id: "readonly",
-      label: "Read Only",
+      label: "只读",
       sandboxMode: "read-only",
       approvalPolicy: "never",
     }),
     createLaunchProfile({
       id: "review",
-      label: "Review",
+      label: "审查",
       sandboxMode: "workspace-write",
       approvalPolicy: "on-request",
     }),
@@ -67,7 +67,7 @@ export function createBuiltinLaunchProfiles(
     profiles.push(
       createLaunchProfile({
         id: "full-access",
-        label: "Full Access",
+        label: "完全访问",
         sandboxMode: "danger-full-access",
         approvalPolicy: "never",
       }),

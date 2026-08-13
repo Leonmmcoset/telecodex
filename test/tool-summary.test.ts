@@ -18,7 +18,7 @@ describe("tool summary formatting", () => {
     ]);
 
     expect(formatToolSummaryLine(toolCounts)).toBe(
-      "Tools used: 3x bash, 2x subagents, web_fetch",
+      "已使用工具：3x bash, 2x subagents, web_fetch",
     );
   });
 
@@ -29,6 +29,6 @@ describe("tool summary formatting", () => {
         cachedInputTokens: 3,
         outputTokens: 9,
       }),
-    ).toBe("🪙 in: 12 · cached: 3 · out: 9");
+    ).toBe("🪙 输入：12 · 缓存：3 · 输出：9");
   });
 });

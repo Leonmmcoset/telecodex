@@ -101,7 +101,7 @@ describe("codex-launch", () => {
     const profile = createDefaultLaunchProfile("workspace-write", "never");
 
     expect(formatLaunchProfileBehavior(profile)).toBe("workspace-write / never");
-    expect(formatLaunchProfileLabel(profile, true)).toContain("Default");
+    expect(formatLaunchProfileLabel(profile, true)).toContain("默认");
     expect(formatLaunchProfileLabel(profile, true)).toContain("✓");
   });
 
@@ -109,21 +109,21 @@ describe("codex-launch", () => {
     expect(createBuiltinLaunchProfiles(createDefaultLaunchProfile("workspace-write", "never"))).toEqual([
       {
         id: "default",
-        label: "Default",
+        label: "默认",
         sandboxMode: "workspace-write",
         approvalPolicy: "never",
         unsafe: false,
       },
       {
         id: "readonly",
-        label: "Read Only",
+        label: "只读",
         sandboxMode: "read-only",
         approvalPolicy: "never",
         unsafe: false,
       },
       {
         id: "review",
-        label: "Review",
+        label: "审查",
         sandboxMode: "workspace-write",
         approvalPolicy: "on-request",
         unsafe: false,
@@ -137,28 +137,28 @@ describe("codex-launch", () => {
     ).toEqual([
       {
         id: "default",
-        label: "Default",
+        label: "默认",
         sandboxMode: "workspace-write",
         approvalPolicy: "never",
         unsafe: false,
       },
       {
         id: "readonly",
-        label: "Read Only",
+        label: "只读",
         sandboxMode: "read-only",
         approvalPolicy: "never",
         unsafe: false,
       },
       {
         id: "review",
-        label: "Review",
+        label: "审查",
         sandboxMode: "workspace-write",
         approvalPolicy: "on-request",
         unsafe: false,
       },
       {
         id: "full-access",
-        label: "Full Access",
+        label: "完全访问",
         sandboxMode: "danger-full-access",
         approvalPolicy: "never",
         unsafe: true,
