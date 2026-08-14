@@ -43,6 +43,7 @@ export interface CodexSessionCallbacks {
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+  onTurnStatus?: (status: "reconnecting" | "completed" | "failed" | "interrupted") => void;
   onPlanUpdate?: (update: AppServerPlanUpdate) => void;
   onUserInputRequest?: (
     request: AppServerUserInputRequest,

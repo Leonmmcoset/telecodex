@@ -16,6 +16,7 @@ export function renderHelpMessage(): DualText {
         ["/new", "新建会话"],
         ["/plan", "切换 Plan Mode"],
         ["/session", "查看当前会话详情"],
+        ["/status", "查看当前任务状态"],
         ["/sessions", "浏览并切换会话"],
         ["/attach", "将 Codex 会话绑定到当前话题"],
         ["/handback", "将会话交还给 Codex CLI"],
@@ -37,6 +38,7 @@ export function renderHelpMessage(): DualText {
         ["/auth", "检查认证状态"],
         ["/login", "开始认证"],
         ["/logout", "退出登录"],
+        ["/security", "查看当前安全配置"],
       ],
     },
     {
@@ -45,6 +47,8 @@ export function renderHelpMessage(): DualText {
         ["/start", "欢迎与状态"],
         ["/help", "查看命令说明"],
         ["/voice", "查看语音转写状态"],
+        ["/git", "查看 Git 状态、diff 和提交记录"],
+        ["/usage day|week", "查看 token 用量"],
       ],
     },
   ];

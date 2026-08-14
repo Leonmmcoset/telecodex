@@ -44,7 +44,18 @@ import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
+import {
+  getGitDiffReport,
+  getGitFileDiff,
+  getGitLog,
+  getGitRemotes,
+  getGitStatus,
+  type GitDiffReport,
+  type GitFileChange,
+} from "./git.js";
 import { SessionRegistry } from "./session-registry.js";
+import { renderSecurityReport } from "./security.js";
+import { UsageStore, type UsageSummary } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
 import { ensureWorkspaceDirectory } from "./workspace.js";
 
@@ -118,6 +129,142 @@ type PlanMessage = {
   messageId: number;
 };
 
+type TaskStatus = "planning" | "awaitingConfirmation" | "running" | "reconnecting" | "completed" | "failed" | "cancelled";
+
+type TaskMode = "default" | "plan" | "planExecution";
+
+type TaskUsage = {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+};
+
+type TaskState = {
+  status: TaskStatus;
+  mode: TaskMode;
+  chatId: TelegramChatId;
+  messageThreadId?: number;
+  startedAt: number;
+  finishedAt?: number;
+  currentStep?: string;
+  progress: number;
+  usage?: TaskUsage;
+  cancellationRequested?: boolean;
+  terminalNotified: boolean;
+  workspace: string;
+  gitBaseline?: GitDiffReport;
+  usageRecorded?: boolean;
+};
+
+export function formatTaskDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const parts = [hours > 0 ? `${hours} 小时` : undefined, minutes > 0 ? `${minutes} 分` : undefined, seconds > 0 || hours === 0 && minutes === 0 ? `${seconds} 秒` : undefined];
+  return parts.filter((part): part is string => Boolean(part)).join(" ");
+}
+
+export function formatTaskCompletionNotification(durationMs: number, usage?: TaskUsage): string {
+  return [
+    "✅ 任务已完成",
+    `⏱️ 耗时：${formatTaskDuration(durationMs)}`,
+    usage ? formatTurnUsageLine(usage) : undefined,
+  ].filter((line): line is string => Boolean(line)).join("\n");
+}
+
+export function formatTaskFailureNotification(durationMs: number, reason: string): string {
+  return [
+    "❌ 任务执行失败",
+    `⏱️ 耗时：${formatTaskDuration(durationMs)}`,
+    `📝 原因：${reason}`,
+  ].join("\n");
+}
+
+export function formatTaskCancelledNotification(durationMs: number): string {
+  return ["⏹️ 任务已取消", `⏱️ 已运行：${formatTaskDuration(durationMs)}`].join("\n");
+}
+
+export function selectTaskGitChanges(
+  baseline: GitDiffReport | undefined,
+  report: GitDiffReport,
+): GitFileChange[] {
+  const before = new Map((baseline?.files ?? []).map((file) => [file.path, file.signature]));
+  return report.files.filter((file) => before.get(file.path) !== file.signature);
+}
+
+export function formatGitChangeIcon(kind: GitFileChange["kind"]): string {
+  switch (kind) {
+    case "added":
+    case "untracked":
+      return "➕";
+    case "deleted":
+      return "➖";
+    case "renamed":
+      return "🔁";
+    default:
+      return "✏️";
+  }
+}
+
+export function formatUsageSummary(label: string, summary: UsageSummary): string {
+  return [
+    `🪙 ${label} token 用量`,
+    `任务轮次：${summary.taskCount}`,
+    `输入：${summary.inputTokens} · 缓存：${summary.cachedInputTokens} · 输出：${summary.outputTokens}`,
+  ].join("\n");
+}
+
+type ReferencedTelegramMessage = {
+  message_id: number;
+  from?: { first_name?: string; username?: string };
+  text?: string;
+  caption?: string;
+  photo?: unknown[];
+  document?: { file_name?: string };
+  voice?: unknown;
+  audio?: unknown;
+  video?: unknown;
+  sticker?: unknown;
+};
+
+export function formatReplyContext(message: ReferencedTelegramMessage | undefined): string | undefined {
+  if (!message) return undefined;
+  const sender = message.from?.username
+    ? `@${message.from.username}`
+    : message.from?.first_name ?? "未知发送者";
+  const content = message.text?.trim() || message.caption?.trim() || describeReferencedMessage(message);
+  return [
+    "用户回复了以下 Telegram 消息，请将其作为上下文引用：",
+    `- 消息 ID：${message.message_id}`,
+    `- 发送者：${sender}`,
+    `- 内容：${trimLine(content, 2_000)}`,
+    "",
+    "用户当前请求如下：",
+  ].join("\n");
+}
+
+function describeReferencedMessage(message: ReferencedTelegramMessage): string {
+  if (message.document) return `文件：${message.document.file_name ?? "未命名文件"}`;
+  if (message.photo?.length) return "图片消息";
+  if (message.voice) return "语音消息";
+  if (message.audio) return "音频消息";
+  if (message.video) return "视频消息";
+  if (message.sticker) return "贴纸消息";
+  return "非文本 Telegram 消息";
+}
+
+function withReplyContext(input: CodexPromptInput, context: string | undefined): CodexPromptInput {
+  if (!context) return input;
+  if (typeof input === "string") {
+    return `${context}\n${input}`;
+  }
+  return {
+    ...input,
+    text: [context, input.text].filter((part): part is string => Boolean(part?.trim())).join("\n"),
+  };
+}
+
 function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): InlineKeyboard {
   const totalPages = Math.max(1, Math.ceil(items.length / KEYBOARD_PAGE_SIZE));
   const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -173,6 +320,9 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const planRenderQueues = new Map<TelegramContextKey, Promise<void>>();
   const pendingWorkspacePathRequests = new Set<TelegramContextKey>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
+  const taskStates = new Map<TelegramContextKey, TaskState>();
+  const usageStore = new UsageStore(config.workspace);
+  const pendingGitDiffs = new Map<string, { workspace: string; filePath: string; chatId: TelegramChatId; messageThreadId?: number }>();
 
   registry.onRemove((key) => {
     contextBusy.delete(key);
@@ -201,6 +351,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       if (action.contextKey === key) pendingPlanActions.delete(actionId);
     }
     lastPromptInput.delete(key);
+    taskStates.delete(key);
+    for (const [id, pending] of pendingGitDiffs.entries()) {
+      if (pending.chatId === parseContextKey(key).chatId) pendingGitDiffs.delete(id);
+    }
   });
 
   const getBusyState = (
@@ -218,6 +372,166 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const state = contextBusy.get(contextKey);
     const session = registry.get(contextKey);
     return Boolean(state?.processing || state?.switching || state?.transcribing || session?.isProcessing());
+  };
+
+  const beginTask = (
+    contextKey: TelegramContextKey,
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    mode: TaskMode,
+    status: TaskStatus = "running",
+  ): TaskState => {
+    const task: TaskState = {
+      status,
+      mode,
+      chatId,
+      messageThreadId,
+      startedAt: Date.now(),
+      progress: 0,
+      terminalNotified: false,
+      workspace: registry.get(contextKey)?.getCurrentWorkspace() ?? config.workspace,
+    };
+    taskStates.set(contextKey, task);
+    return task;
+  };
+
+  const updateTask = (contextKey: TelegramContextKey, patch: Partial<TaskState>): TaskState | undefined => {
+    const task = taskStates.get(contextKey);
+    if (!task) return undefined;
+    Object.assign(task, patch);
+    return task;
+  };
+
+  const recordTaskUsage = (contextKey: TelegramContextKey): void => {
+    const task = taskStates.get(contextKey);
+    if (!task?.usage || task.usageRecorded) return;
+    usageStore.record(contextKey, task.usage);
+    task.usageRecorded = true;
+  };
+
+  const sendTaskNotification = async (
+    contextKey: TelegramContextKey,
+    status: "completed" | "failed" | "cancelled",
+    reason?: string,
+  ): Promise<void> => {
+    const task = taskStates.get(contextKey);
+    if (!task || task.terminalNotified) return;
+
+    task.status = status;
+    task.finishedAt = Date.now();
+    task.terminalNotified = true;
+    recordTaskUsage(contextKey);
+    const durationMs = task.finishedAt - task.startedAt;
+    const text = status === "completed"
+      ? formatTaskCompletionNotification(durationMs, task.usage)
+      : status === "cancelled"
+        ? formatTaskCancelledNotification(durationMs)
+        : formatTaskFailureNotification(durationMs, reason ?? "未知错误");
+
+    await sendTextMessage(bot.api, task.chatId, text, {
+      fallbackText: text,
+      ...(task.messageThreadId ? { messageThreadId: task.messageThreadId } : {}),
+    }).catch((error) => console.error("发送任务状态通知失败", error));
+    await sendGitDiffSummary(contextKey);
+  };
+
+  const markTaskCancelled = async (contextKey: TelegramContextKey): Promise<void> => {
+    const task = taskStates.get(contextKey);
+    if (!task || task.terminalNotified) return;
+    task.cancellationRequested = true;
+    await sendTaskNotification(contextKey, "cancelled");
+  };
+
+  const captureTaskGitBaseline = async (contextKey: TelegramContextKey): Promise<void> => {
+    const task = taskStates.get(contextKey);
+    if (!task) return;
+    task.gitBaseline = await getGitDiffReport(task.workspace).catch(() => undefined);
+  };
+
+  const sendGitDiffSummary = async (contextKey: TelegramContextKey): Promise<void> => {
+    const task = taskStates.get(contextKey);
+    if (!task) return;
+    const report = await getGitDiffReport(task.workspace).catch(() => undefined);
+    if (!report?.repository) return;
+
+    const changes = selectTaskGitChanges(task.gitBaseline, report);
+    if (changes.length === 0) return;
+
+    const keyboard = new InlineKeyboard();
+    const additions = changes.reduce((sum, file) => sum + file.additions, 0);
+    const deletions = changes.reduce((sum, file) => sum + file.deletions, 0);
+    const htmlLines = [
+      "🧾 <b>本次任务文件变更</b>",
+      `<b>分支：</b><code>${escapeHTML(report.branch)}</code>`,
+      `<b>文件：</b>${changes.length} 个 · <b>新增：</b>${additions} 行 · <b>删除：</b>${deletions} 行`,
+      "",
+    ];
+    const plainLines = [
+      "🧾 本次任务文件变更",
+      `分支：${report.branch}`,
+      `文件：${changes.length} 个 · 新增：${additions} 行 · 删除：${deletions} 行`,
+      "",
+    ];
+
+    for (const file of changes.slice(0, 20)) {
+      const callbackId = randomUUID().slice(0, 12);
+      pendingGitDiffs.set(callbackId, {
+        workspace: task.workspace,
+        filePath: file.path,
+        chatId: task.chatId,
+        messageThreadId: task.messageThreadId,
+      });
+      const line = `${formatGitChangeIcon(file.kind)} ${file.path} · +${file.additions} -${file.deletions}`;
+      htmlLines.push(`${formatGitChangeIcon(file.kind)} <code>${escapeHTML(file.path)}</code> · +${file.additions} -${file.deletions}`);
+      plainLines.push(line);
+      keyboard.text(`查看 ${trimLine(file.path, 32)}`, `git_diff_file:${callbackId}`).row();
+    }
+    if (changes.length > 20) {
+      htmlLines.push(`……还有 ${changes.length - 20} 个文件未显示。`);
+      plainLines.push(`……还有 ${changes.length - 20} 个文件未显示。`);
+    }
+
+    await sendTextMessage(bot.api, task.chatId, htmlLines.join("\n"), {
+      parseMode: "HTML",
+      fallbackText: plainLines.join("\n"),
+      replyMarkup: keyboard,
+      ...(task.messageThreadId ? { messageThreadId: task.messageThreadId } : {}),
+    }).catch((error) => console.error("发送 Git diff 摘要失败", error));
+  };
+
+  const updateTaskFromPlan = (contextKey: TelegramContextKey, update: AppServerPlanUpdate): void => {
+    const total = update.plan.length;
+    const completed = update.plan.filter((step) => step.status === "completed").length;
+    const current = update.plan.find((step) => step.status === "inProgress") ?? update.plan.find((step) => step.status !== "completed");
+    updateTask(contextKey, {
+      currentStep: current?.step,
+      progress: total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0,
+    });
+  };
+
+  const formatTaskStatusMessage = (task: TaskState | undefined): { html: string; plain: string } => {
+    if (!task) {
+      return { html: "ℹ️ 当前没有正在执行的任务。", plain: "ℹ️ 当前没有正在执行的任务。" };
+    }
+    const labels: Record<TaskStatus, string> = {
+      planning: "制定计划",
+      awaitingConfirmation: "等待确认",
+      running: "执行中",
+      reconnecting: "重新连接中",
+      completed: "已完成",
+      failed: "失败",
+      cancelled: "已取消",
+    };
+    const durationMs = (task.finishedAt ?? Date.now()) - task.startedAt;
+    const lines = [
+      "📊 当前任务状态",
+      `状态：${labels[task.status]}`,
+      task.currentStep ? `📌 当前步骤：${task.currentStep}` : undefined,
+      `📈 进度：${task.progress}%`,
+      `⏱️ ${task.status === "running" || task.status === "reconnecting" || task.status === "planning" ? "已耗时" : "耗时"}：${formatTaskDuration(durationMs)}`,
+      task.usage ? formatTurnUsageLine(task.usage) : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+    return { html: formatTelegramHTML(lines), plain: lines };
   };
 
   const getContextSession = async (
@@ -660,14 +974,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       const completionText = buildCompletionText();
       if (completionText) {
         await enqueueRenderedChunks(splitMarkdownForTelegram(completionText));
-      } else if (!sentAgentMessage) {
-        await enqueueRenderedChunks([
-          { text: "<b>✅ 已完成</b>", fallbackText: "✅ 已完成", parseMode: "HTML", sourceText: "✅ 已完成" },
-        ]);
       }
 
       await messageQueue;
       await clearAbortButtons();
+      await sendTaskNotification(contextKey, "completed");
     };
 
     const callbacks: CodexSessionCallbacks = {
@@ -679,6 +990,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onToolStart: (toolName: string, toolCallId: string) => {
+        updateTask(contextKey, {
+          status: "running",
+          currentStep: `正在执行：${toolName}`,
+          progress: Math.max(taskStates.get(contextKey)?.progress ?? 0, 1),
+        });
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
           return;
@@ -730,6 +1046,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
       },
       onToolEnd: (toolCallId: string, isError: boolean) => {
+        const currentProgress = taskStates.get(contextKey)?.progress ?? 0;
+        updateTask(contextKey, {
+          currentStep: isError ? "工具执行失败" : "正在整理执行结果",
+          progress: Math.min(99, Math.max(currentProgress, currentProgress + 5)),
+        });
         if (toolVerbosity === "none" || toolVerbosity === "summary") {
           return;
         }
@@ -767,6 +1088,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         });
       },
       onTodoUpdate: (items) => {
+        const completed = items.filter((item) => item.completed).length;
+        const current = items.find((item) => !item.completed);
+        updateTask(contextKey, {
+          currentStep: current?.text ?? "正在整理执行结果",
+          progress: items.length > 0 ? Math.min(99, Math.round((completed / items.length) * 100)) : 0,
+        });
         if (toolVerbosity === "none") {
           return;
         }
@@ -798,6 +1125,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       },
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
+        updateTask(contextKey, { usage, progress: 100 });
+      },
+      onTurnStatus: (status) => {
+        if (status === "reconnecting") {
+          updateTask(contextKey, { status: "reconnecting", currentStep: "正在重新连接 Codex" });
+        }
       },
       onAgentEnd: () => {},
     };
@@ -831,6 +1164,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
+      beginTask(contextKey, chatId, messageThreadId, "default");
+      await captureTaskGitBaseline(contextKey);
       await session.prompt(userInput, callbacks);
       updateSessionMetadata(contextKey, session);
       await finalizeResponse();
@@ -847,6 +1182,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
           await clearAbortButtons();
         } catch (telegramError) {
           console.error("向 Telegram 发送错误消息失败:", telegramError);
+        }
+        const task = taskStates.get(contextKey);
+        if (task?.cancellationRequested) {
+          await sendTaskNotification(contextKey, "cancelled");
+        } else {
+          await sendTaskNotification(contextKey, "failed", friendlyErrorText(error));
         }
       }
     } finally {
@@ -898,18 +1239,52 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       ...(canConfirm ? {
         confirm: async () => {
           executingConfirmedPlan = true;
-          await session.executePlan("确认上述计划并开始执行。", callbacks);
+          beginTask(contextKey, chatId, messageThreadId, "planExecution");
+          await captureTaskGitBaseline(contextKey);
+          updateTask(contextKey, { currentStep: "正在执行已确认计划" });
+          void bot.api.sendChatAction(chatId, "typing", {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          }).catch(() => {});
+          try {
+            await session.executePlan("确认上述计划并开始执行。", callbacks);
+            updateSessionMetadata(contextKey, session);
+            await sendTaskNotification(contextKey, "completed");
+          } catch (error) {
+            const task = taskStates.get(contextKey);
+            if (task?.cancellationRequested) {
+              await sendTaskNotification(contextKey, "cancelled");
+            } else {
+              await sendTaskNotification(contextKey, "failed", friendlyErrorText(error));
+            }
+            throw error;
+          }
         },
       } : {}),
       steer: async (text) => {
         const steerBusyState = getBusyState(contextKey);
         steerBusyState.processing = true;
+        updateTask(contextKey, {
+          status: "planning",
+          currentStep: "正在更新计划",
+          progress: 0,
+          cancellationRequested: false,
+          finishedAt: undefined,
+          terminalNotified: false,
+        });
         latestPlanInput = text;
         lastPlanAgentMessage = undefined;
         receivedPlanContent = false;
         try {
           await session.continuePlan(text, callbacks);
           await finalizePlanView();
+        } catch (error) {
+          const task = taskStates.get(contextKey);
+          if (task?.cancellationRequested) {
+            await sendTaskNotification(contextKey, "cancelled");
+          } else {
+            await sendTaskNotification(contextKey, "failed", friendlyErrorText(error));
+          }
+          throw error;
         } finally {
           steerBusyState.processing = false;
         }
@@ -920,11 +1295,27 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       regenerate: async () => {
         const regenerateBusyState = getBusyState(contextKey);
         regenerateBusyState.processing = true;
+        updateTask(contextKey, {
+          status: "planning",
+          currentStep: "正在重新生成计划",
+          progress: 0,
+          cancellationRequested: false,
+          finishedAt: undefined,
+          terminalNotified: false,
+        });
         lastPlanAgentMessage = undefined;
         receivedPlanContent = false;
         try {
           await session.continuePlan(latestPlanInput, callbacks);
           await finalizePlanView();
+        } catch (error) {
+          const task = taskStates.get(contextKey);
+          if (task?.cancellationRequested) {
+            await sendTaskNotification(contextKey, "cancelled");
+          } else {
+            await sendTaskNotification(contextKey, "failed", friendlyErrorText(error));
+          }
+          throw error;
         } finally {
           regenerateBusyState.processing = false;
         }
@@ -932,10 +1323,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
 
     const updatePlan = (update: AppServerPlanUpdate): void => {
-      if (executingConfirmedPlan) return;
       const hasPlanContent = Boolean(update.explanation?.trim()) || update.plan.some((step) => step.step.trim());
       if (!hasPlanContent) return;
+      if (executingConfirmedPlan) {
+        updateTaskFromPlan(contextKey, update);
+        updateTask(contextKey, { status: "running" });
+        return;
+      }
       receivedPlanContent = true;
+      updateTaskFromPlan(contextKey, update);
+      updateTask(contextKey, { status: "planning" });
       void renderPlanUpdate(contextKey, chatId, messageThreadId, update, buildPlanActions())
         .catch((error) => console.error("发送 Plan Mode 计划失败", error));
     };
@@ -944,6 +1341,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onAgentMessage: (text) => {
         stopTyping();
         if (executingConfirmedPlan) {
+          updateTask(contextKey, {
+            status: "running",
+            currentStep: "正在生成执行结果",
+            progress: Math.max(taskStates.get(contextKey)?.progress ?? 0, 1),
+          });
           void sendTextMessage(bot.api, chatId, formatTelegramHTML(text), {
             parseMode: "HTML",
             fallbackText: text,
@@ -954,6 +1356,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         lastPlanAgentMessage = text;
       },
       onToolStart: (toolName, toolCallId) => {
+        if (executingConfirmedPlan) {
+          updateTask(contextKey, {
+            status: "running",
+            currentStep: `正在执行：${toolName}`,
+            progress: Math.max(taskStates.get(contextKey)?.progress ?? 0, 1),
+          });
+        }
         if (toolVerbosity === "summary") {
           toolCounts.set(toolName, (toolCounts.get(toolName) ?? 0) + 1);
           return;
@@ -966,6 +1375,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         if (state) state.partialResult = appendWithCap(state.partialResult, partialResult, TOOL_OUTPUT_PREVIEW_LIMIT);
       },
       onToolEnd: (toolCallId, isError) => {
+        if (executingConfirmedPlan) {
+          const currentProgress = taskStates.get(contextKey)?.progress ?? 0;
+          updateTask(contextKey, {
+            currentStep: isError ? "工具执行失败" : "正在整理执行结果",
+            progress: Math.min(99, Math.max(currentProgress, currentProgress + 5)),
+          });
+        }
         const state = toolStates.get(toolCallId);
         if (!state || toolVerbosity === "none" || toolVerbosity === "summary") return;
         const rendered = renderToolEndMessage(state.toolName, state.partialResult, isError);
@@ -980,6 +1396,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onApprovalRequest: (request) => requestPlanApproval(ctx, contextKey, chatId, messageThreadId, request),
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
+        if (executingConfirmedPlan) {
+          updateTask(contextKey, { usage, progress: 100 });
+        }
+      },
+      onTurnStatus: (status) => {
+        if (status === "reconnecting") {
+          updateTask(contextKey, { status: "reconnecting", currentStep: "正在重新连接 Codex" });
+        }
       },
       onAgentEnd: () => {},
     };
@@ -996,6 +1420,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         );
       }
       await (planRenderQueues.get(contextKey) ?? Promise.resolve());
+      if (!executingConfirmedPlan) {
+        updateTask(contextKey, {
+          status: "awaitingConfirmation",
+          currentStep: "等待确认后执行计划",
+          progress: 0,
+        });
+        recordTaskUsage(contextKey);
+      }
       updateSessionMetadata(contextKey, session);
     };
 
@@ -1012,6 +1444,8 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
         return;
       }
 
+      beginTask(contextKey, chatId, messageThreadId, "plan", "planning");
+      await captureTaskGitBaseline(contextKey);
       if (mode === "start") {
         await session.promptPlan(userInput, callbacks);
       } else {
@@ -1021,9 +1455,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       finalized = true;
     } catch (error) {
       if (!finalized) {
-        await safeReply(ctx, renderPromptFailure(error), {
-          fallbackText: renderPromptFailure(error).replace(/<[^>]+>/g, ""),
-        }).catch((telegramError) => console.error("向 Telegram 发送 Plan Mode 错误失败", telegramError));
+        const task = taskStates.get(contextKey);
+        if (task?.cancellationRequested) {
+          await sendTaskNotification(contextKey, "cancelled");
+        } else {
+          await safeReply(ctx, renderPromptFailure(error), {
+            fallbackText: renderPromptFailure(error).replace(/<[^>]+>/g, ""),
+          }).catch((telegramError) => console.error("向 Telegram 发送 Plan Mode 错误失败", telegramError));
+          await sendTaskNotification(contextKey, "failed", friendlyErrorText(error));
+        }
       }
     } finally {
       stopTyping();
@@ -1065,6 +1505,102 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (summary) {
       await safeReply(ctx, escapeHTML(summary), { fallbackText: summary });
     }
+  };
+
+  const sendGitDiffReport = async (ctx: Context, workspace: string): Promise<void> => {
+    const report = await getGitDiffReport(workspace);
+    if (!report.repository) {
+      await safeReply(ctx, "ℹ️ 当前工作区不是 Git 仓库。", { fallbackText: "ℹ️ 当前工作区不是 Git 仓库。" });
+      return;
+    }
+    if (report.files.length === 0) {
+      await safeReply(ctx, `✅ <b>Git 工作区干净。</b>\n<b>分支：</b><code>${escapeHTML(report.branch)}</code>`, {
+        fallbackText: `✅ Git 工作区干净。\n分支：${report.branch}`,
+      });
+      return;
+    }
+
+    const keyboard = new InlineKeyboard();
+    const htmlLines = [
+      "🧾 <b>Git diff 摘要</b>",
+      `<b>分支：</b><code>${escapeHTML(report.branch)}</code>`,
+      `<b>文件：</b>${report.files.length} 个 · <b>新增：</b>${report.additions} 行 · <b>删除：</b>${report.deletions} 行`,
+      "",
+    ];
+    const plainLines = [
+      "🧾 Git diff 摘要",
+      `分支：${report.branch}`,
+      `文件：${report.files.length} 个 · 新增：${report.additions} 行 · 删除：${report.deletions} 行`,
+      "",
+    ];
+    for (const file of report.files.slice(0, 20)) {
+      const callbackId = randomUUID().slice(0, 12);
+      pendingGitDiffs.set(callbackId, {
+        workspace,
+        filePath: file.path,
+        chatId: ctx.chat?.id ?? 0,
+        messageThreadId: parseContextKey(contextKeyFromCtx(ctx) ?? "0").messageThreadId,
+      });
+      htmlLines.push(`${formatGitChangeIcon(file.kind)} <code>${escapeHTML(file.path)}</code> · +${file.additions} -${file.deletions}`);
+      plainLines.push(`${formatGitChangeIcon(file.kind)} ${file.path} · +${file.additions} -${file.deletions}`);
+      keyboard.text(`查看 ${trimLine(file.path, 32)}`, `git_diff_file:${callbackId}`).row();
+    }
+    if (report.files.length > 20) {
+      htmlLines.push(`……还有 ${report.files.length - 20} 个文件未显示。`);
+      plainLines.push(`……还有 ${report.files.length - 20} 个文件未显示。`);
+    }
+    await safeReply(ctx, htmlLines.join("\n"), {
+      fallbackText: plainLines.join("\n"),
+      replyMarkup: keyboard,
+    });
+  };
+
+  const sendGitView = async (
+    ctx: Context,
+    workspace: string,
+    view: "status" | "diff" | "log" | "remotes",
+  ): Promise<void> => {
+    if (view === "diff") {
+      await sendGitDiffReport(ctx, workspace);
+      return;
+    }
+
+    if (view === "status") {
+      const status = await getGitStatus(workspace);
+      if (!status.repository) {
+        await safeReply(ctx, "ℹ️ 当前工作区不是 Git 仓库。", { fallbackText: "ℹ️ 当前工作区不是 Git 仓库。" });
+        return;
+      }
+      const lines = [
+        "📋 <b>Git 状态</b>",
+        `<b>分支：</b><code>${escapeHTML(status.branch)}</code>`,
+        "",
+        ...(status.status.length > 0 ? status.status.map((line) => `<code>${escapeHTML(line)}</code>`) : ["✅ 工作区干净"]),
+      ];
+      await safeReply(ctx, lines.join("\n"), { fallbackText: lines.join("\n").replace(/<[^>]+>/g, "") });
+      return;
+    }
+
+    if (view === "log") {
+      const entries = await getGitLog(workspace);
+      if (entries.length === 0) {
+        await safeReply(ctx, "ℹ️ 当前工作区不是 Git 仓库，或还没有提交记录。", {
+          fallbackText: "ℹ️ 当前工作区不是 Git 仓库，或还没有提交记录。",
+        });
+        return;
+      }
+      const lines = ["🕘 <b>最近提交</b>", ""];
+      for (const entry of entries) {
+        const [hash, date, author, subject] = entry.split("|");
+        lines.push(`<code>${escapeHTML(hash ?? "")}</code> ${escapeHTML(date ?? "")} · ${escapeHTML(subject ?? "")} <i>(${escapeHTML(author ?? "")})</i>`);
+      }
+      await safeReply(ctx, lines.join("\n"), { fallbackText: lines.join("\n").replace(/<[^>]+>/g, "") });
+      return;
+    }
+
+    const remotes = await getGitRemotes(workspace);
+    const lines = ["🌐 <b>Git 远程仓库</b>", "", ...(remotes.length > 0 ? remotes.map((remote) => `<code>${escapeHTML(remote)}</code>`) : ["（未配置远程仓库）"])];
+    await safeReply(ctx, lines.join("\n"), { fallbackText: lines.join("\n").replace(/<[^>]+>/g, "") });
   };
 
   bot.use(async (ctx, next) => {
@@ -1113,6 +1649,65 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   bot.command("help", async (ctx) => {
     const help = renderHelpMessage();
     await safeReply(ctx, help.html, { fallbackText: help.plain });
+  });
+
+  bot.command("status", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+
+    const status = formatTaskStatusMessage(taskStates.get(contextSession.contextKey));
+    await safeReply(ctx, status.html, { fallbackText: status.plain });
+  });
+
+  bot.command("security", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) return;
+    const report = renderSecurityReport(config, contextSession.session.getInfo());
+    const keyboard = new InlineKeyboard().text("⚙️ 启动配置", "security_launch_profiles");
+    await safeReply(ctx, report.html, { fallbackText: report.plain, replyMarkup: keyboard });
+  });
+
+  bot.command("usage", async (ctx) => {
+    const argument = (ctx.message?.text ?? "").replace(/^\/usage(?:@\w+)?/i, "").trim().toLowerCase();
+    const period = argument === "week" || argument === "周" ? "week" : "day";
+    const since = Date.now() - (period === "week" ? 7 : 1) * 24 * 60 * 60 * 1000;
+    const label = period === "week" ? "最近 7 天" : "最近 24 小时";
+    const text = formatUsageSummary(label, usageStore.summarizeSince(since));
+    const keyboard = new InlineKeyboard()
+      .text("📅 最近 24 小时", "usage_view:day")
+      .text("🗓️ 最近 7 天", "usage_view:week");
+    await safeReply(ctx, formatTelegramHTML(text), { fallbackText: text, replyMarkup: keyboard });
+  });
+
+  bot.command("git", async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) return;
+    const argument = (ctx.message?.text ?? "").replace(/^\/git(?:@\w+)?/i, "").trim().toLowerCase();
+    const view = argument === "status" || argument === "diff" || argument === "log" || argument === "remotes"
+      ? argument
+      : undefined;
+    if (view) {
+      await sendGitView(ctx, contextSession.session.getCurrentWorkspace(), view);
+      return;
+    }
+
+    const keyboard = new InlineKeyboard()
+      .text("📋 状态", "git_view:status")
+      .text("🧾 Diff", "git_view:diff")
+      .row()
+      .text("🕘 提交记录", "git_view:log")
+      .text("🌐 远程仓库", "git_view:remotes");
+    await safeReply(ctx, [
+      "<b>Git 控制面板</b>",
+      "",
+      "查看当前工作区的状态、文件 diff、提交记录和远程仓库。",
+      "也可以使用：<code>/git status</code>、<code>/git diff</code>、<code>/git log</code>、<code>/git remotes</code>。",
+    ].join("\n"), {
+      fallbackText: "Git 控制面板\n\n查看当前工作区的状态、文件 diff、提交记录和远程仓库。\n也可以使用：/git status、/git diff、/git log、/git remotes。",
+      replyMarkup: keyboard,
+    });
   });
 
   bot.command("auth", async (ctx) => {
@@ -1320,11 +1915,13 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const workspaces = session.listWorkspaces();
     pendingWorkspacePicks.set(contextKey, workspaces);
     const currentWorkspace = session.getCurrentWorkspace();
-    const workspaceButtons: KeyboardItem[] = workspaces.map((workspace, index) => ({
+    const workspaceButtons: KeyboardItem[] = [
+      { label: "✍️ 输入文件夹路径", callbackData: "ws_new_path" },
+      ...workspaces.map((workspace, index) => ({
       label: `${workspace === currentWorkspace ? "📂" : "📁"} ${getWorkspaceShortName(workspace)}`,
       callbackData: `ws_${index}`,
-    }));
-    workspaceButtons.push({ label: "📁 输入新路径", callbackData: "ws_new_path" });
+      })),
+    ];
     pendingWorkspaceButtons.set(contextKey, workspaceButtons);
     const keyboard = paginateKeyboard(workspaceButtons, 0, "ws");
 
@@ -1342,8 +1939,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const { contextKey, session } = contextSession;
     try {
+      const cancellation = markTaskCancelled(contextKey);
       await session.abort();
       clearPlanInteractionState(contextKey, new Error("操作已取消。"));
+      await cancellation;
       await safeReply(ctx, escapeHTML("已取消当前操作。"), {
         fallbackText: "已取消当前操作。",
       });
@@ -1481,8 +2080,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     if (!argument) {
       const enabled = planModeContexts.has(contextKey);
-      if (enabled) planModeContexts.delete(contextKey);
-      else planModeContexts.add(contextKey);
+      if (enabled) {
+        planModeContexts.delete(contextKey);
+        const cancellation = markTaskCancelled(contextKey);
+        await session.abort();
+        clearPlanInteractionState(contextKey, new Error("Plan Mode 已关闭。"));
+        await cancellation;
+      } else {
+        planModeContexts.add(contextKey);
+      }
       const nowEnabled = !enabled;
       await safeReply(ctx, nowEnabled
         ? "🧭 <b>Plan Mode 已开启。</b>发送下一条消息即可进入计划模式。\n使用 /plan off 关闭。"
@@ -1514,8 +2120,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     if (normalized === "off" || normalized === "关闭") {
       planModeContexts.delete(contextKey);
+      const cancellation = markTaskCancelled(contextKey);
       await session.abort();
       clearPlanInteractionState(contextKey, new Error("Plan Mode 已关闭。"));
+      await cancellation;
       await safeReply(ctx, "🧭 <b>Plan Mode 已关闭。</b>", { fallbackText: "🧭 Plan Mode 已关闭。" });
       return;
     }
@@ -1844,6 +2452,67 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "已过期，请重新运行 /model");
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "已过期，请重新运行 /effort");
 
+  bot.callbackQuery(/^git_view:(status|diff|log|remotes)$/, async (ctx) => {
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    const view = ctx.match?.[1] as "status" | "diff" | "log" | "remotes" | undefined;
+    if (!contextSession || !view) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    await ctx.answerCallbackQuery();
+    await sendGitView(ctx, contextSession.session.getCurrentWorkspace(), view);
+  });
+
+  bot.callbackQuery(/^usage_view:(day|week)$/, async (ctx) => {
+    const period = ctx.match?.[1] as "day" | "week" | undefined;
+    if (!period) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    const since = Date.now() - (period === "week" ? 7 : 1) * 24 * 60 * 60 * 1000;
+    const label = period === "week" ? "最近 7 天" : "最近 24 小时";
+    const text = formatUsageSummary(label, usageStore.summarizeSince(since));
+    const keyboard = new InlineKeyboard()
+      .text("📅 最近 24 小时", "usage_view:day")
+      .text("🗓️ 最近 7 天", "usage_view:week");
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (ctx.chat && messageId) {
+      await safeEditMessage(bot, ctx.chat.id, messageId, formatTelegramHTML(text), {
+        fallbackText: text,
+        replyMarkup: keyboard,
+      });
+    }
+  });
+
+  bot.callbackQuery("security_launch_profiles", async (ctx) => {
+    await ctx.answerCallbackQuery();
+    await openLaunchProfilesPicker(ctx);
+  });
+
+  bot.callbackQuery(/^git_diff_file:([\w-]+)$/, async (ctx) => {
+    const id = ctx.match?.[1];
+    const pending = id ? pendingGitDiffs.get(id) : undefined;
+    if (!pending || pending.chatId !== ctx.chat?.id) {
+      await ctx.answerCallbackQuery({ text: "diff 已过期，请重新运行 /git diff" });
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: `正在读取 ${trimLine(pending.filePath, 32)} 的 diff……` });
+    const diff = await getGitFileDiff(pending.workspace, pending.filePath)
+      .catch((error) => `读取 diff 失败：${friendlyErrorText(error)}`);
+    const maxLength = 24_000;
+    const displayed = diff.length > maxLength ? `${diff.slice(0, maxLength)}\n\n……diff 过长，已截断。` : diff;
+    for (const chunk of splitTelegramText(displayed)) {
+      await sendTextMessage(bot.api, pending.chatId, chunk, {
+        parseMode: undefined,
+        fallbackText: chunk,
+        ...(pending.messageThreadId ? { messageThreadId: pending.messageThreadId } : {}),
+      });
+    }
+  });
+
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
     const contextKey = ctx.match?.[1];
     if (!contextKey) {
@@ -1858,8 +2527,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await ctx.answerCallbackQuery({ text: "正在取消……" });
+    const cancellation = markTaskCancelled(contextKey);
     await session.abort();
     clearPlanInteractionState(contextKey, new Error("操作已取消。"));
+    await cancellation;
   });
 
   bot.callbackQuery("ws_new_path", async (ctx) => {
@@ -1968,9 +2639,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
 
     await ctx.answerCallbackQuery({ text: "正在取消……" });
+    const cancellation = markTaskCancelled(action.contextKey);
     clearPlanInteractionState(action.contextKey, new Error("Plan Mode 已取消。"));
     planModeContexts.delete(action.contextKey);
     await action.cancel().catch((error) => console.error("取消 Plan Mode 失败", error));
+    await cancellation;
     await bot.api.editMessageReplyMarkup(ctx.chat!.id, action.messageId, { reply_markup: new InlineKeyboard() }).catch(() => {});
   });
 
@@ -2482,13 +3155,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       pendingPlanTextRequests.delete(contextKey);
     }
 
-    lastPromptInput.set(contextKey, userText);
+    const promptInput = withReplyContext(
+      userText,
+      formatReplyContext(ctx.message.reply_to_message as ReferencedTelegramMessage | undefined),
+    );
+    lastPromptInput.set(contextKey, promptInput);
     await setReaction(ctx, "👀");
     try {
       if (planModeContexts.has(contextKey)) {
-        await handlePlanPrompt(ctx, contextKey, ctx.chat.id, session, userText, "start");
+        await handlePlanPrompt(ctx, contextKey, ctx.chat.id, session, promptInput, "start");
       } else {
-        await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, userText);
+        await handleUserPrompt(ctx, contextKey, ctx.chat.id, session, promptInput);
       }
       await setReaction(ctx, "👍");
     } catch {
@@ -2555,10 +3232,14 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       return;
     }
 
-    lastPromptInput.set(contextKey, transcript);
+    const promptInput = withReplyContext(
+      transcript,
+      formatReplyContext(ctx.message.reply_to_message as ReferencedTelegramMessage | undefined),
+    );
+    lastPromptInput.set(contextKey, promptInput);
     await setReaction(ctx, "👀");
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, transcript);
+      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
       await setReaction(ctx, "👍");
     } catch {
       await clearReaction(ctx);
@@ -2607,11 +3288,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const promptInput: { text?: string; imagePaths: string[] } = { imagePaths: [tempFilePath] };
     if (caption) {
       promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
     }
+    const contextualPrompt = withReplyContext(
+      promptInput,
+      formatReplyContext(ctx.message.reply_to_message as ReferencedTelegramMessage | undefined),
+    );
+    lastPromptInput.set(contextKey, contextualPrompt);
     await setReaction(ctx, "👀");
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
+      await handleUserPrompt(ctx, contextKey, chatId, session, contextualPrompt);
       await setReaction(ctx, "👍");
     } catch {
       await clearReaction(ctx);
@@ -2703,12 +3388,16 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const caption = ctx.message.caption?.trim();
     if (caption) {
       promptInput.text = caption;
-      lastPromptInput.set(contextKey, caption);
     }
+    const contextualPrompt = withReplyContext(
+      promptInput,
+      formatReplyContext(ctx.message.reply_to_message as ReferencedTelegramMessage | undefined),
+    );
+    lastPromptInput.set(contextKey, contextualPrompt);
 
     await setReaction(ctx, "👀");
     try {
-      await handleUserPrompt(ctx, contextKey, chatId, session, promptInput);
+      await handleUserPrompt(ctx, contextKey, chatId, session, contextualPrompt);
       await setReaction(ctx, "👍");
     } catch {
       await clearReaction(ctx);
@@ -2739,6 +3428,8 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "new", description: "新建会话" },
     { command: "plan", description: "切换 Plan Mode" },
     { command: "session", description: "当前会话详情" },
+    { command: "status", description: "查看当前任务状态" },
+    { command: "security", description: "查看安全配置" },
     { command: "sessions", description: "浏览并切换会话" },
     { command: "retry", description: "重新发送上一条提问" },
     { command: "abort", description: "取消当前操作" },
@@ -2749,6 +3440,8 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "login", description: "开始认证" },
     { command: "logout", description: "退出登录" },
     { command: "voice", description: "语音转写状态" },
+    { command: "git", description: "查看 Git 状态和 diff" },
+    { command: "usage", description: "查看 token 用量" },
     { command: "handback", description: "将会话交还给 Codex CLI" },
     { command: "attach", description: "将 Codex 会话绑定到当前话题" },
     { command: "switch", description: "按 ID 切换会话" },

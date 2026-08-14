@@ -32,6 +32,7 @@ const createCallbacks = (): AppServerCallbacks => ({
   onToolUpdate: vi.fn(),
   onToolEnd: vi.fn(),
   onPlanUpdate: vi.fn(),
+  onTurnStatus: vi.fn(),
   onAgentEnd: vi.fn(),
 });
 
@@ -235,6 +236,7 @@ describe("CodexAppServerClient", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(client.isTurnActive()).toBe(true);
     expect(callbacks.onAgentEnd).not.toHaveBeenCalled();
+    expect(callbacks.onTurnStatus).toHaveBeenCalledWith("reconnecting");
 
     writeJson(fakeProcess, {
       jsonrpc: "2.0",
@@ -243,6 +245,7 @@ describe("CodexAppServerClient", () => {
     });
     await turnPromise;
     expect(callbacks.onAgentEnd).toHaveBeenCalledTimes(1);
+    expect(callbacks.onTurnStatus).toHaveBeenLastCalledWith("completed");
     expect(client.isTurnActive()).toBe(false);
     client.dispose();
   });

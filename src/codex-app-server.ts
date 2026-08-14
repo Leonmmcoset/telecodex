@@ -94,6 +94,7 @@ export interface AppServerCallbacks {
     cachedInputTokens: number;
     outputTokens: number;
   }) => void;
+  onTurnStatus?: (status: "reconnecting" | "completed" | "failed" | "interrupted") => void;
   onAgentEnd: () => void;
 }
 
@@ -473,13 +474,16 @@ export class CodexAppServerClient {
           // The app-server can emit this notification while Codex is
           // reconnecting. It is not a terminal event and must not release the
           // turn waiter or trigger the Telegram completion message.
+          callbacks.onTurnStatus?.("reconnecting");
           return;
         }
         if (params?.turn?.status === "failed") {
+          callbacks.onTurnStatus?.("failed");
           this.rejectTurn(params.turn.error?.message ?? "Codex app-server 执行失败。", params.turn.id ?? turnId);
           return;
         }
         if (params?.turn?.status === "interrupted") {
+          callbacks.onTurnStatus?.("interrupted");
           this.rejectTurn("Codex app-server turn 已中断。", params.turn.id ?? turnId);
           return;
         }
@@ -488,6 +492,7 @@ export class CodexAppServerClient {
           // compatibility. Continue waiting for the actual terminal event.
           return;
         }
+        callbacks.onTurnStatus?.("completed");
         for (const [itemId, text] of this.agentMessageDeltas.entries()) {
           if (text.trim()) callbacks.onAgentMessage(text.trim());
           this.agentMessageDeltas.delete(itemId);

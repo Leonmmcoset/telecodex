@@ -79,6 +79,8 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/help` | Grouped command reference |
 | `/new` | Start a fresh thread (workspace picker if multiple workspaces) |
 | `/session` | Current thread ID, workspace, model, effort, and token totals |
+| `/status` | Current task status, elapsed time, progress, and token usage |
+| `/security` | Current sandbox, approval policy, launch-profile risk, and access controls |
 | `/sessions` | Browse recent threads grouped by workspace; tap to switch |
 | `/switch <id>` | Switch directly to a thread by ID |
 | `/retry` | Resend the last prompt |
@@ -90,6 +92,9 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 | `/login` | Start Codex device-auth flow from Telegram |
 | `/logout` | Sign out of Codex |
 | `/voice` | Check voice transcription backend status |
+| `/git` | Git control panel; supports `status`, `diff`, `log`, and `remotes` subcommands |
+| `/usage day` | Token usage recorded during the last 24 hours |
+| `/usage week` | Token usage recorded during the last 7 days |
 | `/handback` | Print `codex resume <id>` for CLI handoff |
 | `/attach <id>` | Bind an existing Codex thread to this forum topic |
 
@@ -98,6 +103,14 @@ TeleCodex is a Telegram bridge for the OpenAI Codex CLI SDK. It keeps a Codex th
 - **Voice / audio** — send any voice message or audio file; TeleCodex transcribes it and sends the result to Codex
 - **Photos** — send a photo with an optional caption; the image is forwarded to Codex as visual input
 - **Documents** — send a file (with optional caption); TeleCodex stages it in the workspace, runs Codex, and delivers any generated files back as Telegram documents
+- **Reply context** — reply to any Telegram message and write a request; the replied-to text, caption, or attachment description is included as context for Codex
+
+### Git, security & usage
+
+- After Codex completes a task, TeleCodex compares the Git working tree with the task baseline and sends a compact per-file change summary. Each item includes added/deleted line counts and a button to view its diff.
+- `/git` opens buttons for the current workspace's status, working-tree diff, recent commits, and remotes. Use `/git diff` directly when you only need the changed-file summary.
+- `/security` shows the active sandbox, approval policy, launch profile, Telegram access control state, and whether unsafe launch profiles are enabled. Its button opens the launch-profile picker.
+- `/usage day` and `/usage week` show persisted token totals for the previous 24 hours or 7 days. Token usage is stored under `.telecodex/usage.json` in the configured TeleCodex workspace.
 
 ### Tool verbosity
 

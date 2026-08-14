@@ -19,12 +19,15 @@ describe("bot-ui", () => {
       expect(plain).toContain("/help");
       expect(plain).toContain("/retry");
       expect(plain).toContain("/launch_profiles");
+      expect(plain).toContain("/security");
+      expect(plain).toContain("/git");
+      expect(plain).toContain("/usage day|week");
     });
 
-    it("lists all 17 commands", () => {
+    it("lists all 21 commands", () => {
       const { plain } = renderHelpMessage();
       const commandMatches = plain.match(/\/\w+/g) ?? [];
-      expect(commandMatches.length).toBe(17);
+      expect(commandMatches.length).toBe(21);
     });
 
     it("returns valid HTML with bold tags", () => {
