@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
+import { logInfo, logWarn } from "./logger.js";
+
 export type GitChangeKind = "added" | "modified" | "deleted" | "renamed" | "untracked";
 
 export interface GitFileChange {
@@ -31,10 +33,12 @@ const GIT_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 8 * 1024 * 1024;
 
 export async function getGitStatus(workspace: string): Promise<GitStatusReport> {
+  logInfo("git.status.requested", { workspace });
   const branchResult = await runGit(workspace, ["branch", "--show-current"]);
   const statusResult = await runGit(workspace, ["status", "--short", "--untracked-files=all"]);
 
   if (!branchResult.ok && !statusResult.ok) {
+    logWarn("git.repository_unavailable", { workspace });
     return { repository: false, branch: "", status: [] };
   }
 
@@ -46,6 +50,7 @@ export async function getGitStatus(workspace: string): Promise<GitStatusReport> 
 }
 
 export async function getGitDiffReport(workspace: string): Promise<GitDiffReport> {
+  logInfo("git.diff_report.requested", { workspace });
   const status = await getGitStatus(workspace);
   if (!status.repository) {
     return { repository: false, branch: "", files: [], additions: 0, deletions: 0 };
@@ -89,16 +94,25 @@ export async function getGitDiffReport(workspace: string): Promise<GitDiffReport
   await Promise.all(files.map(async (file) => {
     file.signature = await getFileSignature(workspace, file.path);
   }));
-  return {
+  const report = {
     repository: true,
     branch: status.branch,
     files,
     additions: files.reduce((sum, file) => sum + file.additions, 0),
     deletions: files.reduce((sum, file) => sum + file.deletions, 0),
   };
+  logInfo("git.diff_report.completed", {
+    workspace,
+    branch: report.branch,
+    fileCount: report.files.length,
+    additions: report.additions,
+    deletions: report.deletions,
+  });
+  return report;
 }
 
 export async function getGitFileDiff(workspace: string, filePath: string): Promise<string> {
+  logInfo("git.file_diff.requested", { workspace, filePath });
   const absolutePath = path.resolve(workspace, filePath);
   const workspaceRoot = path.resolve(workspace);
   if (!isPathWithinWorkspace(workspaceRoot, absolutePath)) {
@@ -126,6 +140,7 @@ export async function getGitFileDiff(workspace: string, filePath: string): Promi
 }
 
 export async function getGitLog(workspace: string, limit = 8): Promise<string[]> {
+  logInfo("git.log.requested", { workspace, limit });
   const result = await runGit(workspace, [
     "log",
     `-${Math.max(1, Math.min(limit, 20))}`,
@@ -137,6 +152,7 @@ export async function getGitLog(workspace: string, limit = 8): Promise<string[]>
 }
 
 export async function getGitRemotes(workspace: string): Promise<string[]> {
+  logInfo("git.remotes.requested", { workspace });
   const result = await runGit(workspace, ["remote", "-v"]);
   if (!result.ok) return [];
   return result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);

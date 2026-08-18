@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import readline from "node:readline";
 
+import { logError, logInfo, logWarn } from "./logger.js";
+
 export type AppServerRequestId = number | string;
 
 export type AppServerInput =
@@ -138,9 +140,11 @@ export class CodexAppServerClient {
     approvalPolicy: string;
   }): Promise<AppServerThread> {
     if (this.activeThreadId && this.initialized) {
+      logInfo("app_server.thread.reused", { threadId: this.activeThreadId, workspace: options.workspace });
       return { id: this.activeThreadId, model: this.threadModel ?? options.model ?? "" };
     }
     await this.ensureStarted();
+    logInfo("app_server.thread.start_requested", { workspace: options.workspace, model: options.model ?? null });
     const result = await this.request("thread/start", {
       model: options.model ?? null,
       cwd: options.workspace,
@@ -161,9 +165,11 @@ export class CodexAppServerClient {
     approvalPolicy: string;
   }): Promise<AppServerThread> {
     if (this.activeThreadId === options.threadId && this.initialized) {
+      logInfo("app_server.thread.reused", { threadId: options.threadId, workspace: options.workspace });
       return { id: this.activeThreadId, model: this.threadModel ?? options.model ?? "" };
     }
     await this.ensureStarted();
+    logInfo("app_server.thread.resume_requested", { threadId: options.threadId, workspace: options.workspace });
     const result = await this.request("thread/resume", {
       threadId: options.threadId,
       cwd: options.workspace,
@@ -223,6 +229,12 @@ export class CodexAppServerClient {
     });
     let result: any;
     try {
+      logInfo("app_server.turn.start_requested", {
+        threadId: this.activeThreadId,
+        mode: options.collaborationMode ? "plan" : "default",
+        inputCount: input.length,
+        model: options.model ?? null,
+      });
       result = await this.request("turn/start", {
         threadId: this.activeThreadId,
         input,
@@ -236,6 +248,7 @@ export class CodexAppServerClient {
     }
     const turnId = readTurnId(result);
     this.activeTurnId = turnId;
+    logInfo("app_server.turn.started", { threadId: this.activeThreadId, turnId });
     const pending = this.turnWaiters.get("__pending__");
     this.turnWaiters.delete("__pending__");
     if (pending) this.turnWaiters.set(turnId, pending);
@@ -255,6 +268,7 @@ export class CodexAppServerClient {
     if (!this.activeThreadId || !this.activeTurnId) {
       throw new Error("当前没有可继续的 Plan Mode 操作。");
     }
+    logInfo("app_server.turn.steer_requested", { threadId: this.activeThreadId, turnId: this.activeTurnId, inputCount: input.length });
     await this.request("turn/steer", {
       threadId: this.activeThreadId,
       input,
@@ -264,6 +278,7 @@ export class CodexAppServerClient {
 
   async interrupt(): Promise<void> {
     if (this.activeThreadId && this.activeTurnId) {
+      logInfo("app_server.turn.interrupt_requested", { threadId: this.activeThreadId, turnId: this.activeTurnId });
       await this.request("turn/interrupt", {
         threadId: this.activeThreadId,
         turnId: this.activeTurnId,
@@ -284,6 +299,7 @@ export class CodexAppServerClient {
   }
 
   dispose(): void {
+    logInfo("app_server.disposed", { threadId: this.activeThreadId, turnId: this.activeTurnId });
     this.stopping = true;
     this.lineReader?.close();
     this.lineReader = null;
@@ -317,7 +333,9 @@ export class CodexAppServerClient {
     }
 
     this.stopping = false;
-    const child = spawn(resolveCodexBinary(), ["app-server", "--listen", "stdio://", "--session-source", "telecodex"], {
+    const binary = resolveCodexBinary();
+    logInfo("app_server.starting", { executable: path.basename(binary) });
+    const child = spawn(binary, ["app-server", "--listen", "stdio://", "--session-source", "telecodex"], {
       env: process.env as Record<string, string>,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -333,7 +351,10 @@ export class CodexAppServerClient {
     });
     child.stderr.on("data", (chunk) => {
       const text = String(chunk).trim();
-      if (text) console.warn("Codex app-server:", text);
+      if (text) {
+        logWarn("app_server.stderr", { length: text.length });
+        console.warn("Codex app-server:", text);
+      }
     });
 
     await this.request("initialize", {
@@ -342,10 +363,12 @@ export class CodexAppServerClient {
     });
     this.sendNotification("initialized");
     this.initialized = true;
+    logInfo("app_server.initialized");
   }
 
   private request(method: string, params: unknown): Promise<any> {
     const id = this.nextRequestId++;
+    logInfo("app_server.request", { id: String(id), method });
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       try {
@@ -358,6 +381,7 @@ export class CodexAppServerClient {
   }
 
   private sendNotification(method: string, params?: unknown): void {
+    logInfo("app_server.notification.sent", { method });
     this.write({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
   }
 
@@ -399,6 +423,7 @@ export class CodexAppServerClient {
   }
 
   private async handleServerRequest(message: ServerRequest): Promise<void> {
+    logInfo("app_server.server_request", { method: message.method, id: String(message.id) });
     const waiter = this.turnWaiters.get(this.activeTurnId ?? "") ?? this.turnWaiters.get("__pending__");
     const callbacks = waiter?.callbacks;
     try {
@@ -417,6 +442,7 @@ export class CodexAppServerClient {
       }
       this.write({ jsonrpc: "2.0", id: message.id, result });
     } catch (error) {
+      logError("app_server.server_request_failed", error, { method: message.method, id: String(message.id) });
       this.write({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: error instanceof Error ? error.message : String(error) } });
     }
   }
@@ -439,6 +465,7 @@ export class CodexAppServerClient {
 
     switch (method) {
       case "turn/plan/updated":
+        logInfo("app_server.plan.updated", { turnId, stepCount: Array.isArray(params?.plan) ? params.plan.length : 0 });
         callbacks.onPlanUpdate?.(params as AppServerPlanUpdate);
         break;
       case "item/agentMessage/delta":
@@ -470,6 +497,7 @@ export class CodexAppServerClient {
         this.handleItemCompleted(params.item, callbacks);
         break;
       case "turn/completed":
+        logInfo("app_server.turn.status", { turnId, status: params?.turn?.status ?? "unknown" });
         if (params?.turn?.status === "inProgress") {
           // The app-server can emit this notification while Codex is
           // reconnecting. It is not a terminal event and must not release the
@@ -560,6 +588,7 @@ export class CodexAppServerClient {
     const waiter = this.turnWaiters.get(key);
     if (!waiter) return;
     this.turnWaiters.delete(key);
+    logInfo("app_server.turn.completed", { turnId });
     waiter.resolve();
   }
 
@@ -569,10 +598,12 @@ export class CodexAppServerClient {
     const waiter = this.turnWaiters.get(waiterKey);
     if (!waiter) return;
     this.turnWaiters.delete(waiterKey);
+    logWarn("app_server.turn.failed", { turnId: key, message });
     waiter.reject(new Error(message));
   }
 
   private handleProcessError(error: Error): void {
+    logError("app_server.process_failed", error, { threadId: this.activeThreadId, turnId: this.activeTurnId });
     for (const waiter of this.pending.values()) waiter.reject(error);
     this.pending.clear();
     for (const waiter of this.turnWaiters.values()) waiter.reject(error);
@@ -585,6 +616,7 @@ export class CodexAppServerClient {
     this.activeThreadId = thread?.id ?? result?.threadId;
     this.threadModel = result?.model ?? this.threadModel;
     if (!this.activeThreadId) throw new Error("Codex app-server 未返回 thread id。");
+    logInfo("app_server.thread.ready", { threadId: this.activeThreadId, model: this.threadModel ?? null });
     return { id: this.activeThreadId, model: this.threadModel ?? "" };
   }
 }

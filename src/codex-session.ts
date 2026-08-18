@@ -30,6 +30,7 @@ import {
   type AppServerPlanUpdate,
   type AppServerUserInputRequest,
 } from "./codex-app-server.js";
+import { logInfo } from "./logger.js";
 
 export interface CodexSessionCallbacks {
   onAgentMessage: (text: string) => void;
@@ -114,6 +115,12 @@ export class CodexSessionService {
       options?.launchProfileId ?? config.defaultLaunchProfileId,
     );
     service.resetCodexClient();
+    logInfo("codex.session.created", {
+      workspace: service.currentWorkspace,
+      model: service.currentModel ?? null,
+      deferred: Boolean(options?.deferThreadStart),
+      resuming: Boolean(options?.resumeThreadId),
+    });
 
     if (options?.resumeThreadId) {
       await service.resumeThread(options.resumeThreadId);
@@ -295,11 +302,13 @@ export class CodexSessionService {
   }
 
   async abort(): Promise<void> {
+    logInfo("codex.turn.abort_requested", { threadId: this.currentThreadId });
     this.abortController?.abort();
     await this.appServer?.interrupt();
   }
 
   async promptPlan(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    logInfo("codex.plan_turn.started", { workspace: this.currentWorkspace, threadId: this.currentThreadId });
     const client = await this.ensureAppServerThread();
     await client.runPlan(
       this.buildAppServerInput(input),
@@ -313,6 +322,7 @@ export class CodexSessionService {
     const client = await this.ensureAppServerThread();
     const appInput = this.buildAppServerInput(input);
     if (client.isTurnActive()) {
+      logInfo("codex.plan_turn.steered", { workspace: this.currentWorkspace, threadId: this.currentThreadId });
       await client.steer(appInput);
       return;
     }
@@ -326,6 +336,7 @@ export class CodexSessionService {
   }
 
   async executePlan(input: CodexPromptInput, callbacks: CodexSessionCallbacks): Promise<void> {
+    logInfo("codex.plan_execution.started", { workspace: this.currentWorkspace, threadId: this.currentThreadId });
     const client = await this.ensureAppServerThread();
     await client.runDefault(
       this.buildAppServerInput(input),
@@ -350,6 +361,7 @@ export class CodexSessionService {
     if (model) {
       this.currentModel = model;
     }
+    logInfo("codex.thread.created", { workspace: effectiveWorkspace, model: this.currentModel ?? null });
     return this.getInfo();
   }
 
@@ -365,6 +377,7 @@ export class CodexSessionService {
     );
     this.activeThreadLaunchProfile = this.currentLaunchProfile;
     this.currentThreadId = threadId;
+    logInfo("codex.thread.resumed", { workspace: this.currentWorkspace, threadId });
     return this.getInfo();
   }
 
@@ -385,6 +398,7 @@ export class CodexSessionService {
     if (model) {
       this.currentModel = model;
     }
+    logInfo("codex.thread.switched", { workspace, threadId, model: model ?? null });
     return this.getInfo();
   }
 
@@ -402,16 +416,19 @@ export class CodexSessionService {
 
   setModel(slug: string): string {
     this.currentModel = slug;
+    logInfo("codex.model.selected", { model: slug });
     return slug;
   }
 
   setReasoningEffort(effort: ModelReasoningEffort): void {
     this.currentReasoningEffort = effort;
+    logInfo("codex.reasoning_effort.selected", { effort });
   }
 
   setLaunchProfile(profileId: string): CodexLaunchProfile {
     this.currentLaunchProfile = getLaunchProfile(this.config, profileId);
     this.resetCodexClient();
+    logInfo("codex.launch_profile.selected", { profileId, sandbox: this.currentLaunchProfile.sandboxMode });
     return this.currentLaunchProfile;
   }
 
@@ -428,10 +445,12 @@ export class CodexSessionService {
     this.thread = null;
     this.currentThreadId = null;
     this.activeThreadLaunchProfile = null;
+    logInfo("codex.session.handed_back", { workspace: info.workspace, threadId: info.threadId });
     return info;
   }
 
   dispose(): void {
+    logInfo("codex.session.disposed", { workspace: this.currentWorkspace, threadId: this.currentThreadId });
     this.abortController?.abort();
     this.appServer?.dispose();
     this.appServer = null;

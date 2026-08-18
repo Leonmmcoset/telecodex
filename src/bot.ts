@@ -53,6 +53,7 @@ import {
   type GitDiffReport,
   type GitFileChange,
 } from "./git.js";
+import { logError, logInfo, withLogContext } from "./logger.js";
 import { SessionRegistry } from "./session-registry.js";
 import { renderSecurityReport } from "./security.js";
 import { UsageStore, type UsageSummary } from "./usage.js";
@@ -151,6 +152,7 @@ type TaskState = {
   usage?: TaskUsage;
   cancellationRequested?: boolean;
   terminalNotified: boolean;
+  telegramUsername: string;
   workspace: string;
   gitBaseline?: GitDiffReport;
   usageRecorded?: boolean;
@@ -183,6 +185,12 @@ export function formatTaskFailureNotification(durationMs: number, reason: string
 
 export function formatTaskCancelledNotification(durationMs: number): string {
   return ["⏹️ 任务已取消", `⏱️ 已运行：${formatTaskDuration(durationMs)}`].join("\n");
+}
+
+function formatTelegramUsername(ctx: Context): string {
+  const username = ctx.from?.username?.trim();
+  if (username) return `@${username}`;
+  return ctx.from ? `（未设置用户名，ID:${ctx.from.id}）` : "（未知用户）";
 }
 
 export function selectTaskGitChanges(
@@ -297,6 +305,32 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     client: { timeoutSeconds: TELEGRAM_API_TIMEOUT_SECONDS },
   });
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
+  const telegramUsers = new Map<TelegramContextKey, string>();
+  logInfo("bot.created", {
+    workspace: config.workspace,
+    model: config.codexModel ?? null,
+    allowedUserCount: config.telegramAllowedUserIds.length,
+  });
+  bot.use(async (ctx, next) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    const username = formatTelegramUsername(ctx);
+    if (contextKey) telegramUsers.set(contextKey, username);
+    const command = ctx.message?.text?.trim().match(/^\/[\w_]+/)?.[0];
+    const callbackAction = ctx.callbackQuery?.data?.split(/[:_]/, 1)[0];
+    await withLogContext({ contextKey, username }, async () => {
+      logInfo(command ? "telegram.command.received" : callbackAction ? "telegram.callback.received" : "telegram.update.received", {
+        updateId: ctx.update.update_id,
+        command,
+        callbackAction,
+      });
+      try {
+        await next();
+      } catch (error) {
+        logError("telegram.update.failed", error, { updateId: ctx.update.update_id });
+        throw error;
+      }
+    });
+  });
   const contextBusy = new Map<
     TelegramContextKey,
     { processing: boolean; switching: boolean; transcribing: boolean }
@@ -323,8 +357,10 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const taskStates = new Map<TelegramContextKey, TaskState>();
   const usageStore = new UsageStore(config.workspace);
   const pendingGitDiffs = new Map<string, { workspace: string; filePath: string; chatId: TelegramChatId; messageThreadId?: number }>();
+  const getTelegramUsernameForContext = (contextKey: TelegramContextKey): string => telegramUsers.get(contextKey) ?? "（未知用户）";
 
   registry.onRemove((key) => {
+    logInfo("session.removed", { contextKey: key, username: getTelegramUsernameForContext(key) });
     contextBusy.delete(key);
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
@@ -352,6 +388,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
     lastPromptInput.delete(key);
     taskStates.delete(key);
+    telegramUsers.delete(key);
     for (const [id, pending] of pendingGitDiffs.entries()) {
       if (pending.chatId === parseContextKey(key).chatId) pendingGitDiffs.delete(id);
     }
@@ -389,9 +426,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       startedAt: Date.now(),
       progress: 0,
       terminalNotified: false,
+      telegramUsername: getTelegramUsernameForContext(contextKey),
       workspace: registry.get(contextKey)?.getCurrentWorkspace() ?? config.workspace,
     };
     taskStates.set(contextKey, task);
+    logInfo("task.started", { contextKey, username: task.telegramUsername, mode, status, workspace: task.workspace });
     return task;
   };
 
@@ -399,6 +438,15 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const task = taskStates.get(contextKey);
     if (!task) return undefined;
     Object.assign(task, patch);
+    if (patch.status || patch.currentStep || patch.progress !== undefined) {
+      logInfo("task.updated", {
+        contextKey,
+        username: task.telegramUsername,
+        status: patch.status,
+        progress: patch.progress,
+        currentStep: patch.currentStep,
+      });
+    }
     return task;
   };
 
@@ -407,6 +455,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     if (!task?.usage || task.usageRecorded) return;
     usageStore.record(contextKey, task.usage);
     task.usageRecorded = true;
+    logInfo("usage.recorded", { contextKey, username: task.telegramUsername, taskMode: task.mode });
   };
 
   const sendTaskNotification = async (
@@ -420,6 +469,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     task.status = status;
     task.finishedAt = Date.now();
     task.terminalNotified = true;
+    logInfo("task.terminal", { contextKey, username: task.telegramUsername, status, durationMs: task.finishedAt - task.startedAt });
     recordTaskUsage(contextKey);
     const durationMs = task.finishedAt - task.startedAt;
     const text = status === "completed"
@@ -446,6 +496,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     const task = taskStates.get(contextKey);
     if (!task) return;
     task.gitBaseline = await getGitDiffReport(task.workspace).catch(() => undefined);
+    logInfo("git.baseline.captured", {
+      contextKey,
+      username: task.telegramUsername,
+      repository: task.gitBaseline?.repository ?? false,
+      fileCount: task.gitBaseline?.files.length ?? 0,
+    });
   };
 
   const sendGitDiffSummary = async (contextKey: TelegramContextKey): Promise<void> => {
@@ -456,6 +512,12 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
     const changes = selectTaskGitChanges(task.gitBaseline, report);
     if (changes.length === 0) return;
+    logInfo("git.diff_summary.sent", {
+      contextKey,
+      username: task.telegramUsername,
+      branch: report.branch,
+      fileCount: changes.length,
+    });
 
     const keyboard = new InlineKeyboard();
     const additions = changes.reduce((sum, file) => sum + file.additions, 0);
@@ -1166,12 +1228,18 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
       beginTask(contextKey, chatId, messageThreadId, "default");
       await captureTaskGitBaseline(contextKey);
+      logInfo("codex.default_turn.dispatch", {
+        contextKey,
+        username: getTelegramUsernameForContext(contextKey),
+        inputKind: typeof userInput === "string" ? "text" : "attachment",
+      });
       await session.prompt(userInput, callbacks);
       updateSessionMetadata(contextKey, session);
       await finalizeResponse();
     } catch (error) {
       stopTyping();
       if (finalized) {
+        logError("codex.default_turn.post_completion_error", error, { contextKey, username: getTelegramUsernameForContext(contextKey) });
         console.error("Codex 完成后发生提问错误：", formatError(error));
       } else {
         finalized = true;
@@ -1396,11 +1464,11 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
       onApprovalRequest: (request) => requestPlanApproval(ctx, contextKey, chatId, messageThreadId, request),
       onTurnComplete: (usage) => {
         lastTurnUsage = usage;
-        if (executingConfirmedPlan) {
-          updateTask(contextKey, { usage, progress: 100 });
-        }
+        updateTask(contextKey, executingConfirmedPlan ? { usage, progress: 100 } : { usage });
+        logInfo("codex.plan_turn.completed", { contextKey, username: getTelegramUsernameForContext(contextKey), executingConfirmedPlan });
       },
       onTurnStatus: (status) => {
+        logInfo("codex.plan_turn.status", { contextKey, username: getTelegramUsernameForContext(contextKey), status });
         if (status === "reconnecting") {
           updateTask(contextKey, { status: "reconnecting", currentStep: "正在重新连接 Codex" });
         }

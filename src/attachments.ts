@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
+import { logInfo } from "./logger.js";
+
 export interface StagedFile {
   originalName: string;
   safeName: string;
@@ -55,6 +57,12 @@ export async function stageFile(
 
   const localPath = path.join(dir, safeName);
   await writeFile(localPath, buffer);
+  logInfo("attachment.staged", {
+    safeName,
+    mimeType,
+    sizeBytes: buffer.byteLength,
+    workspace: options.workspace,
+  });
 
   return {
     originalName,
@@ -87,6 +95,7 @@ export async function cleanupInbox(workspace: string, turnId: string): Promise<v
   const dir = inboxPath(workspace, turnId);
   try {
     await rm(dir, { recursive: true, force: true });
+    logInfo("attachment.inbox_cleaned", { workspace, turnId });
   } catch {
     // Ignore cleanup failures.
   }

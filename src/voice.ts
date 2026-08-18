@@ -3,6 +3,8 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { readFile } from "node:fs/promises";
 
+import { logInfo } from "./logger.js";
+
 export interface TranscriptionResult {
   text: string;
   backend: "parakeet" | "openai";
@@ -48,9 +50,12 @@ export function _resetImportHook(): void {
 }
 
 export async function transcribeAudio(filePath: string): Promise<TranscriptionResult> {
+  logInfo("voice.transcription.started", { extension: path.extname(filePath).toLowerCase() || null });
   try {
     const parakeetMod = await _importModule(PARAKEET_SPECIFIER);
-    return await transcribeWithParakeet(filePath, parakeetMod);
+    const result = await transcribeWithParakeet(filePath, parakeetMod);
+    logInfo("voice.transcription.completed", { backend: result.backend, durationMs: result.durationMs });
+    return result;
   } catch (error) {
     if (!isModuleNotFoundError(error, PARAKEET_SPECIFIER)) {
       throw error;
@@ -58,7 +63,9 @@ export async function transcribeAudio(filePath: string): Promise<TranscriptionRe
   }
 
   if (hasOpenAIApiKey()) {
-    return await transcribeWithOpenAI(filePath);
+    const result = await transcribeWithOpenAI(filePath);
+    logInfo("voice.transcription.completed", { backend: result.backend, durationMs: result.durationMs });
+    return result;
   }
 
   throw new Error(NO_BACKEND_ERROR);
